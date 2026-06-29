@@ -23,6 +23,8 @@
 #   session id (#{session_id}) while keeping the session:window NAME form for the
 #   window-addressed targets and the recorded meta. Asserted by inspecting which
 #   target fm-spawn passed to new-window / list-windows.
+#
+# shellcheck disable=SC2016  # the literal $7/$9 tokens are tmux session ids (e.g. #{session_id}), not shell variables, and must stay single-quoted
 set -u
 
 # shellcheck source=tests/lib.sh
