@@ -152,6 +152,25 @@ test_numeric_session_targets_by_id() {
   pass "fm-spawn: numeric session is targeted by id for window ops, name form kept for the window target"
 }
 
+# Bug A, regression: the delivery mode and yolo flag must survive a symlinked
+# project. fm-project-mode.sh matches data/projects.md by the projects/<name>
+# registry key ("alpha"), so PROJ_NAME must be the logical entry name, not the
+# physical clone basename ("clone"). With a registry entry for alpha the meta must
+# record its configured mode/yolo, not the no-mistakes/off fallback.
+test_symlinked_project_preserves_mode_and_yolo() {
+  local id=sym-mode-z3 out status meta
+  printf -- '- alpha [direct-PR +yolo] - test project (added 2026-06-29)\n' \
+    > "$HOME_D/data/projects.md"
+  out=$(run_spawn "$id" '$7' 1); status=$?
+  rm -f "$HOME_D/data/projects.md"
+  expect_code 0 "$status" "spawn into a symlinked project with a registry entry should succeed"
+  meta="$HOME_D/state/$id.meta"
+  assert_grep "mode=direct-PR" "$meta" "registry lookup missed for the symlinked project (mode fell back to default)"
+  assert_grep "yolo=on" "$meta" "registry lookup missed for the symlinked project (yolo fell back to default)"
+  pass "fm-spawn: a symlinked project keeps its configured delivery mode and yolo flag"
+}
+
 setup_fixture
 test_symlinked_project_resolves_physical
 test_numeric_session_targets_by_id
+test_symlinked_project_preserves_mode_and_yolo
