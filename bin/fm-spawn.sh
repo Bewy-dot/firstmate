@@ -332,28 +332,43 @@ if [ "$KIND" = secondmate ]; then
     BRIEF="$DATA/$ID/brief.md"
   fi
 else
-  PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+  # pwd -P (physical path), not pwd: tmux reports pane_current_path as the
+  # physical path, so when projects/<name> is a symlink to a clone elsewhere a
+  # logical PROJ_ABS would never equal the pane path and the post-treehouse wait
+  # loop below would exit on its first sample, mistaking the still-in-project pane
+  # for the worktree. Resolving the physical path keeps both comparisons in the
+  # same namespace. Identical to pwd for a non-symlinked project dir.
+  PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd -P)"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 
 # Same session when firstmate already runs inside tmux; dedicated session otherwise.
+# SES is the session NAME (for the session:window targets below and the recorded
+# meta); SES_ID is the session id (e.g. $3). Bare-session targets must use SES_ID:
+# a numeric session name (e.g. "0") is parsed by tmux as a WINDOW INDEX in
+# `new-window -t`/`list-windows -t`, so `-t 0` tries to create at index 0 and a
+# second spawn fails with "index 0 in use". The session id is unambiguous. The
+# session:window targets keep the name form - the colon disambiguates them, and it
+# preserves the session_name:window_name convention the supervision scripts match.
 if [ -n "${TMUX:-}" ]; then
   SES=$(tmux display-message -p '#S')
+  SES_ID=$(tmux display-message -p '#{session_id}')
 else
   tmux has-session -t firstmate 2>/dev/null || tmux new-session -d -s firstmate
   SES=firstmate
+  SES_ID=$(tmux display-message -t firstmate -p '#{session_id}')
 fi
 
 W="fm-$ID"
 T="$SES:$W"
-if tmux list-windows -t "$SES" -F '#{window_name}' | grep -qx "$W"; then
+if tmux list-windows -t "$SES_ID" -F '#{window_name}' | grep -qx "$W"; then
   echo "error: window $T already exists" >&2
   exit 1
 fi
 
-tmux new-window -d -t "$SES" -n "$W" -c "$PROJ_ABS"
+tmux new-window -d -t "$SES_ID" -n "$W" -c "$PROJ_ABS"
 if [ "$KIND" != secondmate ]; then
   tmux send-keys -t "$T" 'treehouse get' Enter
 
@@ -459,7 +474,7 @@ if [ "$KIND" = secondmate ]; then
   YOLO=off
   SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
 else
-  PROJ_NAME=$(basename "$PROJ_ABS")
+  PROJ_NAME=$(basename "$(resolve_project_dir_arg "$PROJ")")
   read -r MODE YOLO <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF

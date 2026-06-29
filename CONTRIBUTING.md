@@ -73,6 +73,8 @@ tests/fm-bootstrap.test.sh                # bootstrap dependency and feature-pro
 tests/fm-fleet-sync.test.sh               # project clone refresh: safe detached recovery, STUCK drift reports, benign skips, and bootstrap relay
 tests/fm-x-mode.test.sh                   # X-mode poll, inbox context round-trip, reply threading, dismiss, dry-run preview, and .env-presence activation tests
 tests/fm-tangle-guard.test.sh             # primary-checkout tangle detection and spawn/brief isolation tests
+tests/fm-brief-modes.test.sh              # fm-brief.sh scaffolding across delivery modes and scout: bash 3.2 apostrophe parse regression and per-mode DoD contract text
+tests/fm-spawn-paths.test.sh              # fm-spawn.sh path resolution and session targeting: symlinked project physical-path detection and numeric session-name window targeting
 tests/fm-spawn-batch.test.sh              # batch dispatch and FM_HOME project-path scoping tests
 tests/fm-update.test.sh                   # fast-forward-only self-update, reread, nudge, dedup, and skip-safety tests
 tests/fm-secondmate-sync.test.sh          # local-HEAD secondmate sync, no-fetch, bootstrap nudge gating, and spawn hook tests
