@@ -48,6 +48,11 @@ test_no_mistakes_brief_scaffolds() {
     "no-mistakes DoD body is missing from the brief"
   assert_grep "After /no-mistakes reports CI green" "$brief" \
     "no-mistakes DoD tail is missing from the brief"
+  # The validation-discipline hard rule (drive ONE run, no thrash) must be baked in.
+  assert_grep "Validation discipline (hard rule" "$brief" \
+    "no-mistakes DoD is missing the validation-discipline hard rule"
+  assert_grep "Drive ONE run to completion" "$brief" \
+    "no-mistakes DoD is missing the one-run instruction"
   # The very apostrophe that broke the old command substitution must survive verbatim.
   assert_grep "no-mistakes' own guidance" "$brief" \
     "the apostrophe-bearing DoD line did not make it into the brief"

@@ -209,7 +209,12 @@ Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow no-mistakes' own guidance for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
-Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
+
+**Validation discipline (hard rule, not advice).**
+Drive ONE run to completion. Respond only to its gates via \`no-mistakes axi respond\`.
+NEVER cancel, reset, reattach, restart, or start a fresh run mid-validation, and NEVER hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix, and doing it yourself duplicates work and thrashes the run.
+Quiet is normal: a run step can take many minutes, so wait for the gate rather than intervening.
+If a run genuinely fails, do NOT loop or restart it - append \`failed: {what failed, with evidence}\` and stop; firstmate decides the recovery.
 
 Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.

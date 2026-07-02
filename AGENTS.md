@@ -399,8 +399,10 @@ The fields below name the run-step states and outcomes it reads from `no-mistake
   The crewmate owes a response; if it is idle-waiting for the run to advance on its own, steer it to follow no-mistakes' active-gate help.
 - `outcome: passed` or `checks-passed` - the helper reports `done`; `passed` means the PR is already merged or closed, while `checks-passed` means it is ready for PR review.
 - `outcome: failed` or `cancelled` - the helper reports `failed`; inspect the run details and recover or report failure with evidence.
-- Red flag - self-fix duplication: a validating crewmate making fresh hand-commits, aborting the run, or re-running it mid-validation is re-doing work the pipeline already owns.
-  Steer it back to no-mistakes' respond flow; the pipeline, not the crewmate, applies validation fixes.
+- Firm rule - one run, no thrash: a validating crewmate drives exactly ONE no-mistakes run to completion, responding only to its gates via `no-mistakes axi respond`.
+  It must never cancel, reset, reattach, restart, or start a fresh run mid-validation, and never make fresh hand-commits or hand-apply fixes while a run is active - the pipeline, not the crewmate, applies every validation fix, and doing it by hand duplicates work and thrashes the run.
+  This churn (cancel/reattach/reset/restart plus hand-fixes) is the single biggest time sink in the ship loop, so treat any of it as an immediate steer back to no-mistakes' respond flow, not a mild red flag.
+  On a genuine run failure the crewmate reports (`failed:` with evidence) rather than looping or restarting; firstmate decides the recovery.
 
 ### PR ready
 
