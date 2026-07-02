@@ -399,8 +399,10 @@ The fields below name the run-step states and outcomes it reads from `no-mistake
   The crewmate owes a response; if it is idle-waiting for the run to advance on its own, steer it to follow no-mistakes' active-gate help.
 - `outcome: passed` or `checks-passed` - the helper reports `done`; `passed` means the PR is already merged or closed, while `checks-passed` means it is ready for PR review.
 - `outcome: failed` or `cancelled` - the helper reports `failed`; inspect the run details and recover or report failure with evidence.
-- Red flag - self-fix duplication: a validating crewmate making fresh hand-commits, aborting the run, or re-running it mid-validation is re-doing work the pipeline already owns.
-  Steer it back to no-mistakes' respond flow; the pipeline, not the crewmate, applies validation fixes.
+- Firm rule - one run, no thrash: a validating crewmate drives exactly ONE no-mistakes run to completion, responding only to its gates via `no-mistakes axi respond`.
+  It must never cancel, reset, reattach, restart, or start a fresh run mid-validation, and never make fresh hand-commits or hand-apply fixes while a run is active - the pipeline, not the crewmate, applies every validation fix, and doing it by hand duplicates work and thrashes the run.
+  This churn (cancel/reattach/reset/restart plus hand-fixes) is the single biggest time sink in the ship loop, so treat any of it as an immediate steer back to no-mistakes' respond flow, not a mild red flag.
+  On a genuine run failure the crewmate reports (`failed:` with evidence) rather than looping or restarting; firstmate decides the recovery.
 
 ### PR ready
 
@@ -638,7 +640,7 @@ Map firstmate's real backlog operations to the approved commands:
 Scaffold with `bin/fm-brief.sh <id> <repo-name>` - it writes `data/<id>/brief.md` with the standard contract (branch setup, status-reporting protocol, push/merge rules, definition of done) and all paths filled in.
 The ship-brief Setup opens with a worktree-isolation assertion ahead of the branch step: the crewmate confirms it is in its own treehouse worktree, not the primary checkout, and stops with `blocked: launched in primary checkout, not an isolated worktree` if not - the upstream half of the worktree-tangle guard (section 8).
 For a ship task the definition of done is shaped by the project's delivery mode (section 6): `no-mistakes` stops after the implementation commit, then firstmate triggers the harness-appropriate no-mistakes validation pipeline; `direct-PR` has the crewmate push and open the PR itself, and `local-only` has it stop at "ready in branch" for firstmate to review and merge locally.
-The no-mistakes brief points to no-mistakes' version-matched guidance and keeps only firstmate-specific wrapper rules for `ask-user` escalation, `--yes` avoidance, and the CI-green done line.
+The no-mistakes brief points to no-mistakes' version-matched guidance and keeps only firstmate-specific wrapper rules: a validation-discipline hard rule (drive ONE run to completion, respond only to its gates, never cancel/reset/reattach/restart or hand-apply fixes mid-run, and on a genuine failure report `failed:` rather than loop or restart - the "one run, no thrash" rule of section 7), plus `ask-user` escalation, `--yes` avoidance, and the CI-green done line.
 The scaffold reads the mode via `fm-project-mode.sh`, so you do not pass it.
 Ship briefs also include the project-memory contract: run `bin/fm-ensure-agents-md.sh` when the project already has agent-memory files or when the task produced durable project-intrinsic knowledge, then record proportionate learnings in `AGENTS.md`.
 For scout tasks add `--scout`: the scaffold swaps the definition of done for the report contract (findings to `data/<id>/report.md`, no branch, no push, no PR) and declares the worktree scratch; scout is mode-agnostic.
