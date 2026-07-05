@@ -44,10 +44,18 @@ test_no_mistakes_brief_scaffolds() {
   assert_contains "$out" "mode=no-mistakes" "no-mistakes brief did not report its mode"
   brief="$HOME_D/data/$id/brief.md"
   assert_present "$brief" "no-mistakes brief file was not written"
-  assert_grep "You drive no-mistakes by responding to its gates" "$brief" \
+  assert_grep "You then drive no-mistakes exactly as usual" "$brief" \
     "no-mistakes DoD body is missing from the brief"
   assert_grep "After /no-mistakes reports CI green" "$brief" \
     "no-mistakes DoD tail is missing from the brief"
+  # Temporary workaround for the axi-run #351/#396 first-run bug: crews start
+  # via the git-hook path instead of `axi run`.
+  assert_grep "git push no-mistakes fm/$id" "$brief" \
+    "no-mistakes DoD is missing the git-push-to-start workaround"
+  assert_grep "#351" "$brief" \
+    "no-mistakes DoD is missing the axi-run bug reference"
+  assert_grep "stale no-mistakes mirror ref" "$brief" \
+    "no-mistakes DoD is missing the stale-mirror-ref blocked instruction"
   # The validation-discipline hard rule (drive ONE run, no thrash) must be baked in.
   assert_grep "Validation discipline (hard rule" "$brief" \
     "no-mistakes DoD is missing the validation-discipline hard rule"

@@ -383,7 +383,8 @@ For `no-mistakes`-mode ship tasks, when a crewmate's status says `done`, trigger
 Load `harness-adapters` for the target harness's skill invocation form; natural language also works if uncertain.
 
 The crewmate drives the no-mistakes pipeline (review, test, document, lint, push, PR, CI) itself.
-The ship brief intentionally does not restate no-mistakes gate mechanics; it points the crewmate to the version-matched SKILL.md loaded by `/no-mistakes`, `no-mistakes axi run --help`, and per-response `help` lines.
+The ship brief intentionally does not restate no-mistakes gate mechanics; it points the crewmate to the version-matched SKILL.md loaded by `/no-mistakes` and per-response `help` lines.
+For now, crews start a run with `git push no-mistakes <branch>` instead of `no-mistakes axi run`, because `axi run` cannot start a first run on a branch with no prior run (kunchenguid/no-mistakes #351/#396) - the push fires the post-receive hook, which creates and starts the run instead; this is a temporary workaround pending an upstream fix. If a push reports "Everything up-to-date", firstmate clears the stale gate-mirror ref left by an earlier `axi run` attempt and has the crewmate retry.
 Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-decision`, captain-owned decisions go back through `no-mistakes axi respond`, crewmate validation avoids `--yes`, and CI-green completion is reported as `done: PR {url} checks green`.
 Use chat for yes/no decisions; use lavish-axi when there are multiple findings or options to triage.
 
