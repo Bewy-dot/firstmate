@@ -49,6 +49,7 @@ Natural language is acceptable if uncertain.
 | Exit command | `/exit` |
 | Interrupt | single Escape |
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`) |
+| Model | Sonnet (forced via `--model sonnet` in `bin/fm-spawn.sh`, regardless of the operator's global default model) |
 
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
