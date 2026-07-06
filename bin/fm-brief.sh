@@ -207,8 +207,10 @@ The task is complete only when committed on your branch.
 When you believe it is complete, append \`done: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
-You drive no-mistakes by responding to its gates, not by implementing fixes.
-Follow no-mistakes' own guidance for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
+**Starting the run (temporary workaround for now).**
+Do NOT start with \`no-mistakes axi run\` - on a branch with no prior run it mis-routes to the daemon's rerun IPC and fails with "no previous run for branch" (kunchenguid/no-mistakes #351/#396). Instead, once your work is committed, run \`git push no-mistakes fm/$ID\`; this fires the post-receive hook, which creates and starts the run for you, exactly as \`axi run\` would. If the push reports "Everything up-to-date" (a stale ref left in the gate mirror by an earlier \`axi run\` attempt), do NOT touch the gate internals yourself - append \`blocked: stale no-mistakes mirror ref for fm/$ID\` and stop; firstmate will clear it and tell you to retry the push. This is a temporary workaround, expected to be reverted to \`axi run\` once the upstream bug is fixed.
+
+You then drive no-mistakes exactly as usual: monitor with \`no-mistakes axi status\` and respond to its gates via \`no-mistakes axi respond\`, not by implementing fixes yourself. Follow no-mistakes' own guidance for the mechanics beyond starting the run: it loads when you invoke /no-mistakes, and the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 
 **Validation discipline (hard rule, not advice).**
 Drive ONE run to completion. Respond only to its gates via \`no-mistakes axi respond\`.
