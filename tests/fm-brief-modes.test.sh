@@ -78,6 +78,7 @@ test_no_mistakes_brief_supplies_intent() {
   brief="$HOME_D/data/$id/brief.md"
   assert_grep 'no-mistakes.intent=' "$brief" \
     "no-mistakes DoD is missing the intent push option"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $intent_b64 is literal brief text, matched not expanded
   assert_grep 'git push -o "no-mistakes.intent=$intent_b64" no-mistakes fm/'"$id" "$brief" \
     "no-mistakes DoD does not push the intent option to start the run"
   assert_grep "awk 'f&&/^# Setup\$/{exit} f; /^# Task\$/{f=1}'" "$brief" \
@@ -85,6 +86,7 @@ test_no_mistakes_brief_supplies_intent() {
   assert_grep '| base64 | tr -d '"'"'\n'"'"'' "$brief" \
     "no-mistakes DoD is missing the base64 encode step"
   # Safe fallback: an empty/failed extraction must never push a malformed option.
+  # shellcheck disable=SC2016  # single quotes are deliberate: $intent_b64 is literal brief text, matched not expanded
   assert_grep 'if [ -n "$intent_b64" ]; then' "$brief" \
     "no-mistakes DoD is missing the empty-intent guard"
   assert_grep "git push no-mistakes fm/$id" "$brief" \
@@ -93,6 +95,7 @@ test_no_mistakes_brief_supplies_intent() {
   assert_grep "awk 'f&&/^# Setup\$/{exit} f; /^# Task\$/{f=1}' \"$brief\"" "$brief" \
     "no-mistakes DoD extraction does not target this task's own brief file"
   # The revert note must name the --intent flag axi run gains it back through.
+  # shellcheck disable=SC2016  # single quotes are deliberate: backticks and quotes are literal brief text, matched not expanded
   assert_grep 'reverted to `axi run --intent "<task text>"`' "$brief" \
     "no-mistakes DoD revert note is missing the --intent flag"
 
