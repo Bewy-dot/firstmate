@@ -208,7 +208,18 @@ When you believe it is complete, append \`done: {summary}\` to the status file a
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
 **Starting the run (temporary workaround for now).**
-Do NOT start with \`no-mistakes axi run\` - on a branch with no prior run it mis-routes to the daemon's rerun IPC and fails with "no previous run for branch" (kunchenguid/no-mistakes #351/#396). Instead, once your work is committed, run \`git push no-mistakes fm/$ID\`; this fires the post-receive hook, which creates and starts the run for you, exactly as \`axi run\` would. If the push reports "Everything up-to-date" (a stale ref left in the gate mirror by an earlier \`axi run\` attempt), do NOT touch the gate internals yourself - append \`blocked: stale no-mistakes mirror ref for fm/$ID\` and stop; firstmate will clear it and tell you to retry the push. This is a temporary workaround, expected to be reverted to \`axi run\` once the upstream bug is fixed.
+Do NOT start with \`no-mistakes axi run\` - on a branch with no prior run it mis-routes to the daemon's rerun IPC and fails with "no previous run for branch" (kunchenguid/no-mistakes #351/#396). Instead, once your work is committed, supply this run's intent (your Task section above) to no-mistakes as a base64 push option instead of letting the pipeline spend an agent step re-inferring it from the transcript, then push to start the run:
+
+\`\`\`sh
+intent_b64=\$(awk 'f&&/^# Setup$/{exit} f; /^# Task$/{f=1}' "$BRIEF" | base64 | tr -d '\n')
+if [ -n "\$intent_b64" ]; then
+  git push -o "no-mistakes.intent=\$intent_b64" no-mistakes fm/$ID
+else
+  git push no-mistakes fm/$ID
+fi
+\`\`\`
+
+This fires the post-receive hook, which creates and starts the run for you, exactly as \`axi run\` would (a malformed or empty intent option blocks the run rather than starting it, which is why the snippet falls back to a plain push when extraction yields nothing). If the push reports "Everything up-to-date" (a stale ref left in the gate mirror by an earlier \`axi run\` attempt), do NOT touch the gate internals yourself - append \`blocked: stale no-mistakes mirror ref for fm/$ID\` and stop; firstmate will clear it and tell you to retry the push. This is a temporary workaround, expected to be reverted to \`axi run --intent "<task text>"\` once the upstream bug is fixed.
 
 You then drive no-mistakes exactly as usual: monitor with \`no-mistakes axi status\` and respond to its gates via \`no-mistakes axi respond\`, not by implementing fixes yourself. Follow no-mistakes' own guidance for the mechanics beyond starting the run: it loads when you invoke /no-mistakes, and the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 
