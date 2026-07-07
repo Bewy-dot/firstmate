@@ -28,8 +28,10 @@
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<session:window> worktree=<path>
-# mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
-# secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
+# mode/yolo/tiering/ci_tests are resolved per-project from data/projects.md for
+# ship/scout tasks (fm-project-mode.sh) and recorded into meta as
+# mode=/yolo=/tiering=/ci_tests=; secondmate spawns record mode=secondmate,
+# yolo=off, tiering=off, ci_tests=off, home=, and projects=.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -464,7 +466,8 @@ EOF
   esac
 fi
 
-# Per-project delivery mode + yolo flag (bin/fm-project-mode.sh; AGENTS.md project management and task lifecycle).
+# Per-project delivery mode + yolo/tiered/ci-tests flags (bin/fm-project-mode.sh;
+# AGENTS.md project management and task lifecycle).
 # Recorded in meta so fm-teardown's safety check and the validate/merge stages can
 # branch on them. Mode governs ship tasks; a scout's deliverable is a report, not a
 # merge, so scout teardown ignores mode.
@@ -472,10 +475,12 @@ SECONDMATE_PROJECTS=
 if [ "$KIND" = secondmate ]; then
   MODE=secondmate
   YOLO=off
+  TIERED=off
+  CITESTS=off
   SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
 else
   PROJ_NAME=$(basename "$(resolve_project_dir_arg "$PROJ")")
-  read -r MODE YOLO <<EOF
+  read -r MODE YOLO TIERED CITESTS <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
@@ -489,6 +494,8 @@ mkdir -p "$STATE"
   echo "kind=$KIND"
   echo "mode=$MODE"
   echo "yolo=$YOLO"
+  echo "tiering=$TIERED"
+  echo "ci_tests=$CITESTS"
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"

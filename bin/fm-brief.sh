@@ -24,6 +24,11 @@
 #   direct-PR    implement -> push + open PR via gh-axi (no pipeline) -> captain merge
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                firstmate reviews, captain approves, firstmate merges to local main
+# A no-mistakes project with the +tiered flag on gets a tier-aware starting-the-run
+# step: the crew classifies its diff with bin/fm-tier.sh before pushing and trims
+# the skip set (document, plus test under +ci-tests) only at tier=1; review and ci
+# are never in any skip set. Untiered projects get the plain intent-only push,
+# byte-for-byte unchanged.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Ship tasks include a project-memory section so durable project-intrinsic
@@ -167,7 +172,8 @@ fi
 
 # Ship task: shape Setup / Rule 1 / Definition of done by the project's delivery mode.
 # yolo does not affect the brief (it governs firstmate's approval behaviour), so discard it.
-read -r MODE _ <<EOF
+# tiered/ci-tests only affect the no-mistakes DoD's starting-the-run step (below).
+read -r MODE _ TIERED CITESTS <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
 
@@ -201,12 +207,34 @@ EOF
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
-    IFS= read -r -d '' DOD <<EOF || true
-# Definition of done
-The task is complete only when committed on your branch.
-When you believe it is complete, append \`done: {summary}\` to the status file and stop.
-Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+    if [ "$TIERED" = on ]; then
+      if [ "$CITESTS" = on ]; then
+        SKIP_LIST="document,test"
+      else
+        SKIP_LIST="document"
+      fi
+      IFS= read -r -d '' STARTRUN <<EOF || true
+**Starting the run (tiered - this project has risk/size-tiered validation enabled).**
+Do NOT start with \`no-mistakes axi run\` - on a branch with no prior run it mis-routes to the daemon's rerun IPC and fails with "no previous run for branch" (kunchenguid/no-mistakes #351/#396). Instead, once your work is committed, classify your diff and supply this run's intent as a base64 push option, then push to start the run:
 
+\`\`\`sh
+intent_b64=\$(awk 'f&&/^# Setup$/{exit} f; /^# Task$/{f=1}' "$BRIEF" | base64 | tr -d '\n')
+tier_line=\$("$FM_ROOT/bin/fm-tier.sh" . 2>/tmp/fm-tier-$ID.err) && tier=\$(printf '%s' "\$tier_line" | sed -n 's/^tier=\([0-9]*\).*/\1/p') || tier=2
+[ -n "\${tier:-}" ] || tier=2
+SKIP_OPT=""
+[ "\$tier" = "1" ] && SKIP_OPT="-o no-mistakes.skip=$SKIP_LIST"
+if [ -n "\$intent_b64" ]; then
+  git push \$SKIP_OPT -o "no-mistakes.intent=\$intent_b64" no-mistakes fm/$ID
+else
+  git push \$SKIP_OPT no-mistakes fm/$ID
+fi
+\`\`\`
+
+\`review\` and \`ci\` are never skipped, at any tier - only \`$SKIP_LIST\` can be trimmed, and only at tier=1. Report the tier line (\`\$tier_line\`, or \`tier=2 reason=classifier-failed\` if \`fm-tier.sh\` errored) verbatim in your done status. This fires the post-receive hook, which creates and starts the run for you, exactly as \`axi run\` would (a malformed or empty intent option blocks the run rather than starting it, which is why the snippet falls back to a plain push when extraction yields nothing). If the push reports "Everything up-to-date" (a stale ref left in the gate mirror by an earlier \`axi run\` attempt), do NOT touch the gate internals yourself - append \`blocked: stale no-mistakes mirror ref for fm/$ID\` and stop; firstmate will clear it and tell you to retry the push. This is a temporary workaround, expected to be reverted to \`axi run --intent "<task text>"\` once the upstream bug is fixed.
+EOF
+      STARTRUN=${STARTRUN%$'\n'}
+    else
+      IFS= read -r -d '' STARTRUN <<EOF || true
 **Starting the run (temporary workaround for now).**
 Do NOT start with \`no-mistakes axi run\` - on a branch with no prior run it mis-routes to the daemon's rerun IPC and fails with "no previous run for branch" (kunchenguid/no-mistakes #351/#396). Instead, once your work is committed, supply this run's intent (your Task section above) to no-mistakes as a base64 push option instead of letting the pipeline spend an agent step re-inferring it from the transcript, then push to start the run:
 
@@ -220,6 +248,16 @@ fi
 \`\`\`
 
 This fires the post-receive hook, which creates and starts the run for you, exactly as \`axi run\` would (a malformed or empty intent option blocks the run rather than starting it, which is why the snippet falls back to a plain push when extraction yields nothing). If the push reports "Everything up-to-date" (a stale ref left in the gate mirror by an earlier \`axi run\` attempt), do NOT touch the gate internals yourself - append \`blocked: stale no-mistakes mirror ref for fm/$ID\` and stop; firstmate will clear it and tell you to retry the push. This is a temporary workaround, expected to be reverted to \`axi run --intent "<task text>"\` once the upstream bug is fixed.
+EOF
+      STARTRUN=${STARTRUN%$'\n'}
+    fi
+    IFS= read -r -d '' DOD <<EOF || true
+# Definition of done
+The task is complete only when committed on your branch.
+When you believe it is complete, append \`done: {summary}\` to the status file and stop.
+Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+
+$STARTRUN
 
 You then drive no-mistakes exactly as usual: monitor with \`no-mistakes axi status\` and respond to its gates via \`no-mistakes axi respond\`, not by implementing fixes yourself. Follow no-mistakes' own guidance for the mechanics beyond starting the run: it loads when you invoke /no-mistakes, and the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 
