@@ -220,6 +220,41 @@ test_policy_file_additively_forces_high_risk() {
   pass "fm-tier: the additive per-project tier-policy file forces high-risk on matching paths"
 }
 
+test_substringy_code_filenames_are_not_tests() {
+  local dir out
+  dir="$TMP_ROOT/substringtest"
+  mkrepo "$dir"
+  start_change "$dir" substring-change
+  mkdir -p "$dir/lib"
+  # filenames that contain "test"/"spec" only as a substring are code, not
+  # tests: without a real test signal a small code change must escalate to T2.
+  printf 'console.log(1)\n' > "$dir/lib/latest.py"
+  printf 'console.log(2)\n' > "$dir/lib/special.js"
+  printf 'console.log(3)\n' > "$dir/lib/respective.rb"
+  commit_all "$dir" "substringy-but-not-test code files"
+  out=$("$TIER" "$dir" main)
+  assert_contains "$out" "tier=2" "code files merely containing test/spec as a substring must not count as a test signal"
+  assert_contains "$out" "reason=no-test-signal" "no genuine test present, so reason should be no-test-signal"
+  pass "fm-tier: latest/special/respective classify as code, not tests"
+}
+
+test_real_test_filename_conventions_signal_tier1() {
+  local dir out
+  dir="$TMP_ROOT/realtestname"
+  mkrepo "$dir"
+  start_change "$dir" realtest-change
+  mkdir -p "$dir/lib"
+  # a genuine test-convention filename in the diff supplies the test signal
+  # directly (no sibling tree needed), so a small code+test change is tier=1.
+  printf 'console.log(1)\n' > "$dir/lib/latest.js"
+  printf 'test("x", function(){})\n' > "$dir/lib/latest.test.js"
+  commit_all "$dir" "code plus a real .test.js file"
+  out=$("$TIER" "$dir" main)
+  assert_contains "$out" "tier=1" "a real foo.test.js in the diff should supply the test signal for tier=1"
+  assert_contains "$out" "reason=code-small" "with a genuine test present the reason should be code-small"
+  pass "fm-tier: a real foo.test.js filename is recognised as a test signal"
+}
+
 test_no_changes_is_tier0() {
   local dir out
   dir="$TMP_ROOT/nochanges"
@@ -243,4 +278,6 @@ test_unknown_binary_forces_tier2
 test_permission_only_change_is_unknown
 test_code_change_without_test_signal_is_tier2
 test_policy_file_additively_forces_high_risk
+test_substringy_code_filenames_are_not_tests
+test_real_test_filename_conventions_signal_tier1
 test_no_changes_is_tier0

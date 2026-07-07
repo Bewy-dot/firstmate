@@ -184,13 +184,17 @@ is_docs() {
   return 1
 }
 
+# is_test_token <string>: true when the string, split into word tokens on the
+# separators / . _ - , contains a token that IS exactly test(s) or spec(s), so
+# real path-component / filename conventions match (tests/, __tests__/,
+# foo.test.js, foo_test.py, test_foo.py, foo.spec.ts, spec_helper.rb) while a
+# bare substring (latest.py, special.js, inspector.ts, respective.rb) does not.
+is_test_token() {
+  lc "$1" | tr '/._-' '\n\n\n\n' | grep -qxE 'tests?|specs?'
+}
+
 is_test() {
-  local lcp
-  lcp=$(lc "$1")
-  case "$lcp" in
-    *test*|*spec*) return 0 ;;
-  esac
-  return 1
+  is_test_token "$1"
 }
 
 is_code_ext() {
@@ -234,10 +238,20 @@ classify_one() {
 }
 
 sibling_tests_exist() {
-  local d=$1 target
+  local d=$1 target entry
   target="$DIR/$d"
   [ -d "$target" ] || target="$DIR"
-  find "$target" -maxdepth 2 \( -iname '*test*' -o -iname '*spec*' -o -iname '__tests__' \) 2>/dev/null | grep -q .
+  # -iname is a cheap superset prefilter; is_test_token then refines each hit to
+  # the same token convention, so a sibling merely containing "test"/"spec" as a
+  # substring (latest.js) is not counted as a test tree.
+  find "$target" -maxdepth 2 \( -iname '*test*' -o -iname '*spec*' \) 2>/dev/null | {
+    while IFS= read -r entry; do
+      if is_test_token "$(basename "$entry")"; then
+        echo y
+        break
+      fi
+    done
+  } | grep -q y
 }
 
 # --- classify every changed file --------------------------------------------
