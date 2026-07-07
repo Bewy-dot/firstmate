@@ -160,6 +160,21 @@ test_high_risk_forces_tier2_regardless_of_size() {
   pass "fm-tier: a high-risk path (migrations/*.sql) forces tier=2 regardless of diff size"
 }
 
+test_pnpm_lockfile_forces_tier2() {
+  local dir out
+  dir="$TMP_ROOT/pnpmlock"
+  mkrepo "$dir"
+  start_change "$dir" pnpm-change
+  # pnpm-lock.yaml ends in .yaml, which is_code_ext would otherwise claim as
+  # code; a dependency lockfile must always force tier=2.
+  printf 'lockfileVersion: 9.0\n' > "$dir/pnpm-lock.yaml"
+  commit_all "$dir" "a one-line pnpm lockfile change"
+  out=$("$TIER" "$dir" main)
+  assert_contains "$out" "tier=2" "a pnpm-lock.yaml change must force tier=2 even at 1 line / 1 file"
+  assert_contains "$out" "reason=high-risk:pnpm-lock.yaml" "pnpm lockfile reason should be high-risk"
+  pass "fm-tier: pnpm-lock.yaml (a .yaml lockfile) forces tier=2 (high-risk)"
+}
+
 test_unknown_binary_forces_tier2() {
   local dir out
   dir="$TMP_ROOT/binary"
@@ -274,6 +289,7 @@ test_tier1_at_the_100_5_boundary
 test_tier2_one_line_past_the_boundary
 test_tier2_too_many_files
 test_high_risk_forces_tier2_regardless_of_size
+test_pnpm_lockfile_forces_tier2
 test_unknown_binary_forces_tier2
 test_permission_only_change_is_unknown
 test_code_change_without_test_signal_is_tier2

@@ -162,6 +162,9 @@ is_high_risk() {
     docker-compose*.yml|docker-compose*.yaml|*/docker-compose*.yml|*/docker-compose*.yaml) return 0 ;;
     package.json|package-lock.json|npm-shrinkwrap.json) return 0 ;;
     */package.json|*/package-lock.json|*/npm-shrinkwrap.json) return 0 ;;
+    pnpm-lock.yaml|*/pnpm-lock.yaml) return 0 ;;
+    bun.lockb|*/bun.lockb) return 0 ;;
+    gradle.lockfile|*/gradle.lockfile) return 0 ;;
     *.lock) return 0 ;;
     go.mod|go.sum|*/go.mod|*/go.sum) return 0 ;;
     Gemfile|*/Gemfile) return 0 ;;
