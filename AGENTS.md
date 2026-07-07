@@ -41,11 +41,12 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   secondmates.md     secondmate routing table; maintained by fm-home-seed.sh (section 6)
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
+  tier-policy/<project>  optional per-project high-risk glob extension read by fm-tier.sh; can only force more paths to T2, never fewer (section 6)
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
   <id>.turn-ended    touched by turn-end hooks
-  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, kind=, mode=, yolo=; kind=secondmate also records home= and projects=; fm-pr-check appends pr= and verified pr_head=; fm-x-link appends x_request= and x_request_ts= (section 14)
+  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, kind=, mode=, yolo=, tiering=, ci_tests=; kind=secondmate also records home= and projects=; fm-pr-check appends pr= and verified pr_head=; fm-x-link appends x_request= and x_request_ts= (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
