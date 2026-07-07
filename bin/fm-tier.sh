@@ -193,7 +193,7 @@ is_docs() {
 # foo.test.js, foo_test.py, test_foo.py, foo.spec.ts, spec_helper.rb) while a
 # bare substring (latest.py, special.js, inspector.ts, respective.rb) does not.
 is_test_token() {
-  lc "$1" | tr '/._-' '\n\n\n\n' | grep -qxE 'tests?|specs?'
+  lc "$1" | tr '/._-' '\n' | grep -qxE 'tests?|specs?'
 }
 
 is_test() {
