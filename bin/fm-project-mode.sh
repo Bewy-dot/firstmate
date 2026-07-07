@@ -77,7 +77,7 @@ $parsed
 EOF
 case "$mode" in
   no-mistakes|direct-PR|local-only) ;;
-  *) echo "warn: unknown mode \"$mode\" for $NAME; defaulting to no-mistakes off" >&2; mode=no-mistakes; yolo=off ;;
+  *) echo "warn: unknown mode \"$mode\" for $NAME; defaulting to no-mistakes off off off" >&2; mode=no-mistakes; yolo=off; tiered=off; citests=off ;;
 esac
 case "$yolo" in on|off) ;; *) yolo=off ;; esac
 case "$tiered" in on|off) ;; *) tiered=off ;; esac
