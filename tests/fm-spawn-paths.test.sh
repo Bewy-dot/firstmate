@@ -172,7 +172,28 @@ test_symlinked_project_preserves_mode_and_yolo() {
   pass "fm-spawn: a symlinked project keeps its configured delivery mode and yolo flag"
 }
 
+# The widened fm-project-mode.sh output ("<mode> <yolo> <tiered> <ci-tests>")
+# must be recorded into meta as tiering=/ci_tests=, and absent flags must default
+# off rather than corrupting yolo (the read -r MODE YOLO TIERED CITESTS width bug
+# the report warned about: a two-var read on a four-word line would merge the
+# trailing words into YOLO).
+test_symlinked_project_preserves_tiered_and_ci_tests() {
+  local id=sym-tier-z4 out status meta
+  printf -- '- alpha [no-mistakes +tiered +ci-tests] - test project (added 2026-06-29)\n' \
+    > "$HOME_D/data/projects.md"
+  out=$(run_spawn "$id" '$7' 1); status=$?
+  rm -f "$HOME_D/data/projects.md"
+  expect_code 0 "$status" "spawn into a symlinked project with a tiered registry entry should succeed"
+  meta="$HOME_D/state/$id.meta"
+  assert_grep "mode=no-mistakes" "$meta" "tiered registry entry lost its mode"
+  assert_grep "yolo=off" "$meta" "tiered registry entry's yolo was corrupted by the widened read"
+  assert_grep "tiering=on" "$meta" "meta did not record tiering=on"
+  assert_grep "ci_tests=on" "$meta" "meta did not record ci_tests=on"
+  pass "fm-spawn: tiered/ci-tests flags are recorded in meta without corrupting mode/yolo"
+}
+
 setup_fixture
 test_symlinked_project_resolves_physical
 test_numeric_session_targets_by_id
 test_symlinked_project_preserves_mode_and_yolo
+test_symlinked_project_preserves_tiered_and_ci_tests

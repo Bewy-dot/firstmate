@@ -26,6 +26,8 @@ cat > "$HOME_D/data/projects.md" <<'REG'
 - nmrepo [no-mistakes] - test (added 2026-06-29)
 - dprrepo [direct-PR] - test (added 2026-06-29)
 - lorepo [local-only] - test (added 2026-06-29)
+- tieredrepo [no-mistakes +tiered] - test (added 2026-07-07)
+- tieredcirepo [no-mistakes +tiered +ci-tests] - test (added 2026-07-07)
 REG
 
 run_brief() {
@@ -112,6 +114,45 @@ test_no_mistakes_brief_supplies_intent() {
   pass "fm-brief: no-mistakes DoD supplies base64 intent on the starting push with a safe fallback"
 }
 
+# A +tiered project's no-mistakes DoD swaps in the tier-aware starting-the-run
+# snippet: it classifies the diff with bin/fm-tier.sh before pushing, trims the
+# skip set only at tier=1, and never puts review or ci in that skip set. The
+# per-project +ci-tests flag additionally adds `test` to the tier=1 skip list
+# (captain decision: skip local test only for projects whose CI runs the same
+# suite). An untiered project's brief must not mention tiering at all - the
+# byte-for-byte-unchanged-by-default guarantee.
+test_tiered_brief_uses_trimmed_skip_set() {
+  local brief
+  run_brief tier-z7 tieredrepo >/dev/null
+  brief="$HOME_D/data/tier-z7/brief.md"
+  assert_grep "risk/size-tiered validation enabled" "$brief" \
+    "tiered DoD is missing its tiered-mode heading"
+  assert_grep 'fm-tier.sh" .' "$brief" \
+    "tiered DoD does not run the classifier against the crew's own worktree"
+  # shellcheck disable=SC2016  # single quotes are deliberate: literal brief text, matched not expanded
+  assert_grep 'SKIP_OPT="-o no-mistakes.skip=document"' "$brief" \
+    "tiered DoD (no ci-tests) should skip only document at tier=1"
+  assert_no_grep "no-mistakes.skip=document,test" "$brief" \
+    "tiered DoD without +ci-tests must not also skip test"
+  # shellcheck disable=SC2016  # single quotes are deliberate: literal brief text, matched not expanded
+  assert_grep '`review` and `ci` are never skipped, at any tier' "$brief" \
+    "tiered DoD is missing the review/ci-never-skipped guarantee"
+  assert_grep "Report the tier line" "$brief" \
+    "tiered DoD does not ask the crew to report its computed tier"
+  assert_grep "tier=2 reason=classifier-failed" "$brief" \
+    "tiered DoD does not treat a classifier failure as tier=2"
+
+  run_brief tierci-z8 tieredcirepo >/dev/null
+  brief="$HOME_D/data/tierci-z8/brief.md"
+  assert_grep "no-mistakes.skip=document,test" "$brief" \
+    "tiered+ci-tests DoD should skip document and test at tier=1"
+
+  brief="$HOME_D/data/nm-default-z1/brief.md"
+  assert_no_grep "fm-tier.sh" "$brief" \
+    "an untiered project's brief must not mention the tier classifier at all"
+  pass "fm-brief: a +tiered project's DoD classifies the diff and trims only document (plus test under +ci-tests), never review/ci"
+}
+
 # direct-PR and local-only DoD blocks (also previously built via command
 # substitution) scaffold and carry their mode-specific contract.
 test_other_modes_scaffold() {
@@ -150,5 +191,6 @@ test_no_trailing_blank_line() {
 
 test_no_mistakes_brief_scaffolds
 test_no_mistakes_brief_supplies_intent
+test_tiered_brief_uses_trimmed_skip_set
 test_other_modes_scaffold
 test_no_trailing_blank_line

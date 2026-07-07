@@ -146,6 +146,8 @@ This does not relax directive #1: firstmate never hand-writes project `AGENTS.md
 
 Orthogonal is an optional `+yolo` flag (`[direct-PR +yolo]`), default off and **not recommended**: with `yolo` on, firstmate makes approval decisions itself instead of asking (section 7). When the captain adds a project without saying, default to `no-mistakes` with yolo off; set a faster mode or `+yolo` only on explicit say-so.
 
+Also orthogonal, `no-mistakes`-only, is `+tiered` (`[no-mistakes +tiered]`), default off, captain opt-in per project: a deterministic classifier (`bin/fm-tier.sh`, pure git diff, no agent) buckets the finished diff so the crew starts a lighter gate for small, charted changes. Docs-only diffs take the `direct-PR` path; a diff at or under 100 changed lines and 5 files, entirely code/test/docs, with no high-risk paths and a test-presence signal, skips the `document` step (plus local `test` too when the project also carries `+ci-tests`, meaning its CI already runs the same suite); anything touching migrations, SQL, auth/RLS, secrets, env, keys, CI workflows, or dependency manifests/lockfiles - or anything the classifier cannot positively classify - takes the full gate. `review` and CI are never skipped, at any tier; uncertainty always escalates to the full gate. Set `+tiered` only on explicit say-so.
+
 **Clone existing:** `git clone <url> projects/<name>`, add its registry line with the chosen mode, then initialize only if mode is `no-mistakes`.
 
 **Create new:** `no-mistakes` and `direct-PR` need a GitHub repo first (they push to `origin`); `local-only` needs no remote. Creating a GitHub repo is outward-facing: get the captain's consent first (propose name, owner/org, visibility default private, delivery mode), create with `gh-axi` only after they confirm, then clone into `projects/<name>` and initialize only if `no-mistakes`. For `local-only`, create the local repo under `projects/<name>` and skip GitHub.
@@ -209,6 +211,8 @@ Judge a validating crewmate by run-step status, never by whether its shell is ru
 - `outcome: failed` or `cancelled` - helper reports `failed`; inspect run details and recover or report failure with evidence.
 
 **One run, no thrash (firm rule).** A validating crewmate drives exactly ONE no-mistakes run to completion, responding only to its gates via `no-mistakes axi respond`. It must never cancel, reset, reattach, restart, or start a fresh run mid-validation, and never hand-commit or hand-apply fixes while a run is active - the pipeline applies every fix; treat any such churn as an immediate steer back to the respond flow. On a genuine run failure it reports (`failed:` with evidence) rather than looping or restarting; firstmate decides recovery.
+
+**Tier verification (`+tiered` projects only).** Before relaying the PR, re-run `bin/fm-tier.sh` read-only against the crew's worktree and compare it to the crew's reported tier line and to the skip steps `no-mistakes axi status` actually recorded. A crew that skipped more than its computed tier allows is a faithful-reporting failure, not a gate to trust: treat the PR as unvalidated, tell the captain plainly, and have the crew re-run the full gate.
 
 ### PR ready
 
