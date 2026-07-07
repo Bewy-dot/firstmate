@@ -67,6 +67,48 @@ test_no_mistakes_brief_scaffolds() {
   pass "fm-brief: no-mistakes default brief scaffolds with its full DoD"
 }
 
+# The no-mistakes DoD supplies the run's intent (the crew's own Task section) as
+# a base64 push option on the same starting push, instead of letting the
+# pipeline spend an agent step re-inferring it from the transcript. Malformed
+# or empty intent must never reach the gate: the snippet falls back to a plain
+# push when extraction yields nothing.
+test_no_mistakes_brief_supplies_intent() {
+  local id=nm-intent-z6 brief b64
+  run_brief "$id" nmrepo >/dev/null
+  brief="$HOME_D/data/$id/brief.md"
+  assert_grep 'no-mistakes.intent=' "$brief" \
+    "no-mistakes DoD is missing the intent push option"
+  assert_grep 'git push -o "no-mistakes.intent=$intent_b64" no-mistakes fm/'"$id" "$brief" \
+    "no-mistakes DoD does not push the intent option to start the run"
+  assert_grep "awk 'f&&/^# Setup\$/{exit} f; /^# Task\$/{f=1}'" "$brief" \
+    "no-mistakes DoD is missing the Task-section extraction"
+  assert_grep '| base64 | tr -d '"'"'\n'"'"'' "$brief" \
+    "no-mistakes DoD is missing the base64 encode step"
+  # Safe fallback: an empty/failed extraction must never push a malformed option.
+  assert_grep 'if [ -n "$intent_b64" ]; then' "$brief" \
+    "no-mistakes DoD is missing the empty-intent guard"
+  assert_grep "git push no-mistakes fm/$id" "$brief" \
+    "no-mistakes DoD is missing the plain-push fallback for empty intent"
+  # Extraction must run against this task's own absolute brief path.
+  assert_grep "awk 'f&&/^# Setup\$/{exit} f; /^# Task\$/{f=1}' \"$brief\"" "$brief" \
+    "no-mistakes DoD extraction does not target this task's own brief file"
+  # The revert note must name the --intent flag axi run gains it back through.
+  assert_grep 'reverted to `axi run --intent "<task text>"`' "$brief" \
+    "no-mistakes DoD revert note is missing the --intent flag"
+
+  # The extraction snippet, run for real against this brief once its {TASK}
+  # placeholder is filled, must actually produce the Task text, base64-encoded
+  # and single-line - proving the generated command works, not just its text.
+  b64=$(awk 'f&&/^# Setup$/{exit} f; /^# Task$/{f=1}' "$brief" | base64 | tr -d '\n')
+  case "$b64" in
+    *$'\n'*) fail "extracted intent base64 is not single-line" ;;
+  esac
+  [ -n "$b64" ] || fail "extraction produced no intent from a brief with a Task section"
+  assert_contains "$(printf '%s' "$b64" | base64 -d)" '{TASK}' \
+    "decoded intent does not round-trip the brief's Task section"
+  pass "fm-brief: no-mistakes DoD supplies base64 intent on the starting push with a safe fallback"
+}
+
 # direct-PR and local-only DoD blocks (also previously built via command
 # substitution) scaffold and carry their mode-specific contract.
 test_other_modes_scaffold() {
@@ -104,5 +146,6 @@ test_no_trailing_blank_line() {
 }
 
 test_no_mistakes_brief_scaffolds
+test_no_mistakes_brief_supplies_intent
 test_other_modes_scaffold
 test_no_trailing_blank_line
