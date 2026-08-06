@@ -52,7 +52,8 @@
 #   pr-ready=<sound>[,<channel>]    disables that one class. A leading comma
 #   attention=<sound>[,<channel>]   (`,herdr`) keeps the default sound.
 #
-# Channels: auto (default), macos, herdr, both, none.
+# Channels: auto (default), macos, herdr, both, none. FM_NOTIFY_CHANNEL
+# overrides every configured channel with one directive.
 #   auto resolves to macos when osascript is available, else herdr when the
 #   herdr CLI is available, else nothing. macOS Notification Center is
 #   preferred even inside herdr because named system sounds are what make the
@@ -203,6 +204,9 @@ notify_resolve_class() {  # <class>
     sound=
   fi
   [ -n "$sound" ] || sound=$(notify_default_sound "$class")
+  # FM_NOTIFY_CHANNEL wins over every configured channel, matching how
+  # FM_WEDGE_ALARM_CHANNEL overrides config/wedge-alarm.
+  [ -z "${FM_NOTIFY_CHANNEL:-}" ] || channel=$FM_NOTIFY_CHANNEL
   [ -n "$channel" ] || channel=$(notify_config_lookup channel)
   [ -n "$channel" ] || channel=auto
   NOTIFY_SOUND=$sound

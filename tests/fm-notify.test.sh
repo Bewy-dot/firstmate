@@ -42,8 +42,18 @@ reset_log() {
   : > "$LOG"
 }
 
-# Run the notifier against the primary home with the recorder seam installed.
+# Run the notifier against the primary home with the recorder seam installed and
+# the channel pinned. Pinning matters: `auto` resolves against the machine's own
+# osascript/herdr binaries, so every assertion about a class, sound, config key,
+# or dedup would otherwise only hold on macOS and go silently vacuous on a Linux
+# CI runner. Channel resolution itself is asserted separately, below.
 notify() {  # <arg>...
+  FM_NOTIFY_CHANNEL=macos notify_unpinned "$@"
+}
+
+# The same run with no channel pin, for the assertions that are about channel
+# resolution itself.
+notify_unpinned() {  # <arg>...
   FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$PRIMARY/state" FM_NOTIFY_EXEC="$RECORDER" \
     "$NOTIFY" "$@"
 }
@@ -135,17 +145,26 @@ pass "a repeated config key resolves to its last assignment"
 
 reset_log
 printf 'attention=Hero,herdr\n' > "$CONFIG"
-notify attention "t" "b"
+notify_unpinned attention "t" "b"
 assert_contains "$(logged)" "herdr request t b" "a per-class channel must route to herdr with the herdr sound"
 pass "a per-class channel override routes that class to its own channel"
 
 reset_log
 printf 'channel=both\n' > "$CONFIG"
-notify pr-merged "t" "b"
+notify_unpinned pr-merged "t" "b"
 OUT=$(logged)
 assert_contains "$OUT" "macos Glass t b" "channel=both must still post the macOS tag"
 assert_contains "$OUT" "herdr done t b" "channel=both must also post the herdr tag"
 pass "channel=both posts through both channels"
+
+reset_log
+printf 'channel=macos\nattention=Hero,herdr\n' > "$CONFIG"
+FM_NOTIFY_CHANNEL=herdr notify_unpinned attention "t" "b"
+assert_contains "$(logged)" "herdr request t b" "FM_NOTIFY_CHANNEL must win over every configured channel"
+reset_log
+FM_NOTIFY_CHANNEL=none notify_unpinned attention "t" "b"
+[ -z "$(logged)" ] || fail "FM_NOTIFY_CHANNEL=none must post nothing"
+pass "FM_NOTIFY_CHANNEL overrides both the per-class and the default configured channel"
 
 reset_log
 printf 'attention=Hero; rm -rf /\n' > "$CONFIG"
@@ -255,7 +274,7 @@ reset_log
 
 surface() {  # <task> — run mark_surfaced against the real library
   FM_HOME="$SURFACE_HOME" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$SURFACE_STATE" \
-  FM_NOTIFY_EXEC="$RECORDER" bash -c '
+  FM_NOTIFY_EXEC="$RECORDER" FM_NOTIFY_CHANNEL=macos bash -c '
     . "$1/bin/fm-push-transition-lib.sh"
     mark_surfaced "$2"
   ' _ "$ROOT" "$SURFACE_STATE/$1.status"
