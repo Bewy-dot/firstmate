@@ -49,15 +49,17 @@
 #   enabled=off                     global kill switch (on|off, default on)
 #   channel=<channel>               default channel for every class (default auto)
 #   voice=<name>                    macOS speech voice for every class (default Zoe)
+#   speech-lead-ms=<ms>             silence spoken before every phrase (default 700)
+#   speech-tail-ms=<ms>             silence spoken after every phrase (default 1500)
 #   pr-merged=<sound>[,<channel>]   per-class overrides; the bare value `off`
 #   pr-ready=<sound>[,<channel>]    disables that one class. A leading comma
 #   attention=<sound>[,<channel>]   (`,herdr`) keeps the default sound or phrase.
 #   pr-merged=speak[,<channel>]     the literal value `speak` switches that class
 #   pr-ready=speak[,<channel>]      from a named sound to a spoken phrase - this
 #   attention=speak[,<channel>]     is also the default when the class is unset.
-#   pr-merged-phrase=<text>         the phrase spoken for that class; unset means
-#   pr-ready-phrase=<text>          the captain-chosen default phrase for that
-#   attention-phrase=<text>         class (see notify_default_phrase below).
+#   pr-merged-phrase=<text>         the words spoken for that class, without lead
+#   pr-ready-phrase=<text>          or trailing silence (speech-lead-ms/tail-ms add
+#   attention-phrase=<text>         it); unset means the default phrase below.
 #
 # Channels: auto (default), macos, herdr, both, none. FM_NOTIFY_CHANNEL
 # overrides every configured channel with one directive.
@@ -81,19 +83,22 @@
 # Speech. When a class resolves to speak mode (the default, or an explicit
 # `speak` value), the macOS leg runs `say -v <voice> <phrase>` instead of
 # playing a named sound; herdr keeps its fixed sound regardless, since its CLI
-# has no speech mode. The captain-chosen default phrase per class embeds its
-# own lead-in and trailing silence as macOS speech commands
-# (`[[slnc <ms>]]`), because the audio device is still waking on the first
-# syllable and a short phrase clips at the end without them; a reworded phrase
-# in config/notify should keep that same lead-in/trailing-silence shape. A
-# configured voice or phrase with characters outside a safe plain-text set is
-# refused and the default is used, the same as an unrecognized sound name.
-# Speech never blocks the caller: `say` runs detached in the background under
-# the same FM_NOTIFY_TIMEOUT_SECS bound as every other channel call, so a hung
-# process cannot accumulate and a merge or supervision cycle never waits on it.
-# Fail-soft applies throughout: no `say` binary, an unrecognized or
-# not-installed voice, or a background launch failure for any reason all fall
-# back to that class's named-sound behavior rather than going silent.
+# has no speech mode. Every spoken phrase - the captain-chosen default or a
+# configured <class>-phrase - is wrapped with speech-lead-ms of silence before
+# it and speech-tail-ms after, as macOS speech commands (`[[slnc <ms>]]`),
+# because the audio device is still waking on the first syllable and real
+# playback can clip the tail even when a rendered file measures clean silence
+# there - the device's own buffer drains before it. That padding lives in
+# config, not in the phrase text, so retuning it is a config edit, never a
+# code or wording change. A configured voice, phrase, or padding value outside
+# its safe shape is refused and the default is used, the same as an
+# unrecognized sound name. Speech never blocks the caller: `say` runs detached
+# in the background, stdin closed, under the same FM_NOTIFY_TIMEOUT_SECS bound
+# as every other channel call, so a hung process cannot accumulate and a merge
+# or supervision cycle never waits on it. Fail-soft applies throughout: no
+# `say` binary, an unrecognized or not-installed voice, or a background launch
+# failure for any reason all fall back to that class's named-sound behavior
+# rather than going silent.
 #
 # Test seam: FM_NOTIFY_EXEC replaces every real channel. The special value
 # `discard` fires nothing; any other value is run as
@@ -155,18 +160,58 @@ notify_default_sound() {  # <class>
   esac
 }
 
-# The captain's own chosen phrasing (verified by ear), embedding its own
-# lead-in and trailing silence as macOS speech commands. Only a fallback: a
-# reworded phrase belongs in config/notify's <class>-phrase key, never here.
+# The captain's own chosen phrasing (verified by ear). Lead-in and trailing
+# silence are NOT embedded here - notify_speech_wrap adds them from
+# config/notify's speech-lead-ms/speech-tail-ms, so tuning the pause never
+# requires touching this phrase text. An internal mid-phrase pause (attention's
+# beat after "Hey -") is phrasing, not padding, so it stays inline. Only a
+# fallback: a reworded phrase belongs in config/notify's <class>-phrase key,
+# never here.
 notify_default_phrase() {  # <class>
   case "$1" in
-    pr-merged) printf '%s' '[[rate 170]][[slnc 700]] [[emph +]]Another[[emph -]] one down! [[slnc 1200]]' ;;
-    pr-ready) printf '%s' '[[slnc 700]] Ready for review [[slnc 1200]]' ;;
-    attention) printf '%s' '[[slnc 700]] Hey - [[slnc 200]] take a look [[slnc 1200]]' ;;
+    pr-merged) printf '%s' '[[rate 170]] [[emph +]]Another[[emph -]] one down!' ;;
+    pr-ready) printf '%s' 'Ready for review' ;;
+    attention) printf '%s' 'Hey - [[slnc 200]] take a look' ;;
   esac
 }
 
 NOTIFY_DEFAULT_VOICE=Zoe
+
+# The captain heard real playback clip at the tail even though a measured
+# render showed clean trailing silence: the audio device's own buffer drains
+# before it, so the safe fix is a materially bigger default rather than a
+# tighter measurement. Both ends are configurable in config/notify
+# (speech-lead-ms / speech-tail-ms) so a captain can retune without a code
+# change; 700/1500 are just the shipped defaults.
+NOTIFY_DEFAULT_LEAD_MS=700
+NOTIFY_DEFAULT_TAIL_MS=1500
+
+# A millisecond value must be a small non-negative integer - large enough to
+# pad speech, never large enough to make a notification feel hung.
+notify_ms_valid() {  # <ms>
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$1" -le 10000 ] ;;
+  esac
+}
+
+# Wrap <phrase> with the configured (or default) lead-in and trailing silence.
+# Kept as one wrapper so every speaking path - default phrase or a captain's
+# own <class>-phrase - gets the same padding without repeating it in config.
+notify_speech_wrap() {  # <phrase>
+  local phrase=$1 lead tail
+  lead=$(notify_config_lookup speech-lead-ms)
+  if [ -z "$lead" ] || ! notify_ms_valid "$lead"; then
+    [ -z "$lead" ] || notify_log "ignoring unusable speech-lead-ms; using the default"
+    lead=$NOTIFY_DEFAULT_LEAD_MS
+  fi
+  tail=$(notify_config_lookup speech-tail-ms)
+  if [ -z "$tail" ] || ! notify_ms_valid "$tail"; then
+    [ -z "$tail" ] || notify_log "ignoring unusable speech-tail-ms; using the default"
+    tail=$NOTIFY_DEFAULT_TAIL_MS
+  fi
+  printf '[[slnc %s]] %s [[slnc %s]]' "$lead" "$phrase" "$tail"
+}
 
 # Herdr's CLI accepts only none|done|request, so the class-to-sound map is fixed
 # rather than configurable: there is nothing to tune between three values.
@@ -421,7 +466,7 @@ notify_via_macos_speech() {  # <voice> <phrase> <class> <title> <body>
     notify_via_macos "$(notify_default_sound "$class")" "$title" "$body"
     return $?
   }
-  ( notify_run_bounded say -v "$voice" "$phrase" & )
+  ( notify_run_bounded say -v "$voice" "$phrase" </dev/null & )
   return 0
 }
 
@@ -456,10 +501,11 @@ notify_scope_ok() {
 # otherwise plays its resolved named sound. Shared by the `macos` and `both`
 # channel cases below so the two never drift apart.
 notify_macos_leg() {  # <class> <title> <body>
-  local class=$1 title=$2 body=$3
+  local class=$1 title=$2 body=$3 padded
   if [ "$NOTIFY_MODE" = speak ]; then
     notify_resolve_voice
-    notify_via_macos_speech "$NOTIFY_VOICE" "$NOTIFY_PHRASE" "$class" "$title" "$body" || true
+    padded=$(notify_speech_wrap "$NOTIFY_PHRASE")
+    notify_via_macos_speech "$NOTIFY_VOICE" "$padded" "$class" "$title" "$body" || true
   else
     notify_via_macos "$NOTIFY_SOUND" "$title" "$body" || true
   fi

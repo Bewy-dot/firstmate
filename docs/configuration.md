@@ -132,14 +132,17 @@ An absent file means all three classes are on and speak their default phrase in 
 enabled=off                     # global kill switch (on|off, default on)
 channel=<channel>               # default channel for every class (default auto)
 voice=<name>                    # macOS speech voice for every class (default Zoe)
+speech-lead-ms=<ms>             # silence spoken before every phrase (default 700)
+speech-tail-ms=<ms>             # silence spoken after every phrase (default 1500)
 pr-merged=<sound>[,<channel>]   # per-class sound and optional channel override,
 pr-ready=<sound>[,<channel>]    # or the bare value `off` to silence that class,
 attention=<sound>[,<channel>]   # or the bare value `speak` to switch that class
                                  # from a named sound to a spoken phrase (the
                                  # default when the class is unset)
-pr-merged-phrase=<text>         # the phrase spoken for that class; unset means
-pr-ready-phrase=<text>          # its captain-chosen default phrase
-attention-phrase=<text>
+pr-merged-phrase=<text>         # the words spoken for that class, with no lead
+pr-ready-phrase=<text>          # or trailing silence of their own (speech-lead-ms
+attention-phrase=<text>         # / speech-tail-ms add that); unset means the
+                                 # captain-chosen default phrase
 ```
 
 Channels are `auto` (default), `macos`, `herdr`, `both`, and `none`, and `FM_NOTIFY_CHANNEL` overrides every configured channel with one directive.
@@ -149,9 +152,10 @@ Sounds are named macOS system sounds and default to `Glass` for `pr-merged`, `Pi
 Herdr sounds are fixed per class (`done`, `done`, `request`) because the CLI accepts only three values, and herdr never speaks.
 
 By default (or with the explicit value `speak`), the macOS leg speaks a phrase with `say` instead of playing a named sound; a class explicitly configured with a sound name keeps that pre-speech behavior unchanged.
-Each class's default phrase embeds its own lead-in and trailing silence as macOS speech commands (`[[slnc <ms>]]`), because the audio device is still waking on the first syllable and a short phrase clips at the end without them; a reworded phrase in `<class>-phrase` should keep that same shape.
-A configured voice or phrase with characters outside a safe plain-text set is refused and the default is used, the same as an unrecognized sound name.
-Speech never blocks the caller - `say` runs detached in the background - and falls back to that class's named-sound behavior whenever `say` is missing, the configured voice is not installed, or the background launch fails for any reason.
+Every spoken phrase - the captain-chosen default or a configured `<class>-phrase` - is wrapped with `speech-lead-ms` of silence before it and `speech-tail-ms` after, as macOS speech commands (`[[slnc <ms>]]`), because the audio device is still waking on the first syllable and real playback can clip the tail even when a rendered file measures clean silence there.
+That padding lives in config, not in the phrase text, so retuning it is a config edit, never a code or wording change.
+A configured voice, phrase, or padding value outside its safe shape is refused and the default is used, the same as an unrecognized sound name.
+Speech never blocks the caller - `say` runs detached in the background with stdin closed - and falls back to that class's named-sound behavior whenever `say` is missing, the configured voice is not installed, or the background launch fails for any reason.
 See `bin/fm-notify.sh`'s header for the exact speech mechanics, the execution-seam contract, and the manual smoke commands.
 
 This is separate from the away-mode wedge alarm ([`wedge-alarm.md`](wedge-alarm.md)), which stays a louder, rate-limited alert for a supervision channel that has genuinely wedged.

@@ -12,9 +12,11 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-# The captain-chosen default voice, mirrored here rather than re-derived, so an
+# The captain-chosen defaults, mirrored here rather than re-derived, so an
 # assertion about the *default* reads as a default, not a magic string.
 NOTIFY_TEST_DEFAULT_VOICE=Zoe
+NOTIFY_TEST_DEFAULT_LEAD_MS=700
+NOTIFY_TEST_DEFAULT_TAIL_MS=1500
 
 NOTIFY="$ROOT/bin/fm-notify.sh"
 TMPROOT=$(fm_test_tmproot fm-notify)
@@ -350,12 +352,12 @@ notify pr-merged "t" "b"
 notify pr-ready "t" "b"
 notify attention "t" "b"
 OUT=$(logged)
-assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[rate 170]][[slnc 700]] [[emph +]]Another[[emph -]] one down! [[slnc 1200]]" \
-  "pr-merged must default to speaking the captain's chosen phrase"
-assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc 700]] Ready for review [[slnc 1200]]" \
-  "pr-ready must default to speaking the captain's chosen phrase"
-assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc 700]] Hey - [[slnc 200]] take a look [[slnc 1200]]" \
-  "attention must default to speaking the captain's chosen phrase"
+assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] [[rate 170]] [[emph +]]Another[[emph -]] one down! [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
+  "pr-merged must default to speaking the captain's chosen phrase, padded with the default lead-in and trailing silence"
+assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Ready for review [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
+  "pr-ready must default to speaking the captain's chosen phrase, padded with the default lead-in and trailing silence"
+assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Hey - [[slnc 200]] take a look [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
+  "attention must default to speaking the captain's chosen phrase, padded with the default lead-in and trailing silence"
 LINES=$(logged | wc -l | tr -d '[:space:]')
 [ "$LINES" = 3 ] || fail "expected exactly 3 speech calls, got $LINES: $OUT"
 DISTINCT=$(logged | sort -u | wc -l | tr -d '[:space:]')
@@ -365,15 +367,15 @@ pass "an unconfigured class defaults to speaking its own distinct captain-chosen
 reset_log
 printf 'pr-merged=speak\n' > "$CONFIG"
 notify pr-merged "t" "b"
-assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[rate 170]]" \
+assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] [[rate 170]]" \
   "the literal config value speak must explicitly opt a class into speech"
 pass "the literal config value speak opts a class into speech explicitly"
 
 reset_log
 printf 'attention=speak\nattention-phrase=Yo captain, look here\n' > "$CONFIG"
 notify attention "t" "b"
-assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:Yo captain, look here t b" \
-  "a configured phrase must override the class's default phrase"
+assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Yo captain, look here [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]] t b" \
+  "a configured phrase must override the class's default phrase and still get the default padding"
 pass "config/notify overrides a class's spoken phrase via <class>-phrase"
 
 reset_log
@@ -383,9 +385,30 @@ assert_contains "$(logged)" "speak:Ava:" "a configured voice must override the d
 pass "config/notify overrides the speech voice for every class via voice="
 
 reset_log
+printf 'speech-lead-ms=100\nspeech-tail-ms=3000\n' > "$CONFIG"
+notify pr-ready "t" "b"
+assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc 100]] Ready for review [[slnc 3000]]" \
+  "configured speech-lead-ms/speech-tail-ms must replace the default padding"
+pass "config/notify overrides the lead-in and trailing silence via speech-lead-ms/speech-tail-ms"
+
+reset_log
+printf 'speech-tail-ms=bad; rm -rf /\n' > "$CONFIG"
+notify pr-ready "t" "b"
+assert_contains "$(logged)" "[[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
+  "an unusable speech-tail-ms must fall back to the default trailing silence"
+pass "a speech-tail-ms value that is not a plain non-negative integer is refused, not passed through"
+
+reset_log
+printf 'speech-tail-ms=999999\n' > "$CONFIG"
+notify pr-ready "t" "b"
+assert_contains "$(logged)" "[[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
+  "an out-of-range speech-tail-ms must fall back to the default trailing silence"
+pass "a speech-tail-ms value outside the sane bound is refused, not passed through"
+
+reset_log
 printf 'attention=speak\nattention-phrase=bad; rm -rf /\n' > "$CONFIG"
 notify attention "t" "b"
-assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc 700]] Hey - [[slnc 200]] take a look [[slnc 1200]]" \
+assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Hey - [[slnc 200]] take a look [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
   "an unusable phrase must fall back to the class's own default phrase"
 pass "a phrase carrying characters outside the plain-text allow-list is refused, not passed through"
 
