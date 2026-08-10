@@ -428,21 +428,26 @@ pass "a per-class channel directive works the same for a speaking class as a sou
 
 rm -f "$CONFIG"
 
-# --- speech fail-soft: real say-missing, voice-not-installed, and success ---
+# --- speech fail-soft: real say-missing, voice-not-installed, no afplay -----
 #
-# No FM_NOTIFY_EXEC override here: these exercise the true say-availability and
-# voice-list checks, so a fake osascript/say pair stands in for the real
-# binaries (never the real ones - no test may pop a real notification or make a
-# real sound). All three run with FM_NOTIFY_CHANNEL=macos pinned and the
-# default (unconfigured) speak mode.
+# No FM_NOTIFY_EXEC override here: these exercise the true say/afplay
+# availability and voice-list checks, so fake osascript/say/afplay binaries
+# stand in for the real ones (never the real ones - no test may pop a real
+# notification or make a real sound). All run with FM_NOTIFY_CHANNEL=macos
+# pinned and the default (unconfigured) speak mode.
 
 # NOSAYHOME carries the fake osascript but no say at all, for the say-missing
-# case; SAYHOME carries both, for the voice-not-installed and success cases.
+# case. SAYHOME carries osascript and say but no afplay, for the
+# voice-not-installed case and the afplay-unavailable live-say fallback.
+# AFPLAYHOME carries all three, for the cache render/play/reuse cases below.
 NOSAYHOME="$TMPROOT/nosayhome"
 SAYHOME="$TMPROOT/sayhome"
-mkdir -p "$NOSAYHOME" "$SAYHOME"
+AFPLAYHOME="$TMPROOT/afplayhome"
+mkdir -p "$NOSAYHOME" "$SAYHOME" "$AFPLAYHOME"
 OSA_LOG="$TMPROOT/fake-osascript.log"
 SAY_LOG="$TMPROOT/fake-say.log"
+RENDER_LOG="$TMPROOT/fake-say-render.log"
+AFPLAY_LOG="$TMPROOT/fake-afplay.log"
 SAY_VOICES="$TMPROOT/fake-say-voices.txt"
 
 cat > "$NOSAYHOME/osascript" <<SH
@@ -451,26 +456,44 @@ printf '%s\n' "\$*" >> "$OSA_LOG"
 SH
 chmod +x "$NOSAYHOME/osascript"
 cp "$NOSAYHOME/osascript" "$SAYHOME/osascript"
+cp "$NOSAYHOME/osascript" "$AFPLAYHOME/osascript"
 
+# The fake say handles all three real invocation shapes: the voice-list probe
+# (-v '?'), a render-to-file call (-v <voice> -o <file> <phrase>, logged to
+# RENDER_LOG and given real, non-empty bytes so the cache-hit check passes),
+# and a live speak call (-v <voice> <phrase>, logged to SAY_LOG).
 cat > "$SAYHOME/say" <<SH
 #!/usr/bin/env bash
 if [ "\$1" = -v ] && [ "\$2" = '?' ]; then
   cat "$SAY_VOICES" 2>/dev/null
   exit 0
 fi
+if [ "\$1" = -v ] && [ "\$3" = -o ]; then
+  printf '%s\n' "\$*" >> "$RENDER_LOG"
+  printf 'fake-audio-bytes\n' > "\$4"
+  exit 0
+fi
 printf '%s\n' "\$*" >> "$SAY_LOG"
 SH
 chmod +x "$SAYHOME/say"
+cp "$SAYHOME/say" "$AFPLAYHOME/say"
+
+cat > "$AFPLAYHOME/afplay" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$AFPLAY_LOG"
+SH
+chmod +x "$AFPLAYHOME/afplay"
 
 SPEECHBIN=$(fm_fakebin "$TMPROOT/speechbin")
-for tool in bash env dirname uname git tr find grep awk cat; do
+for tool in bash env dirname uname git tr find grep awk cat mv rm cksum mkdir; do
   TOOLPATH=$(type -P "$tool" 2>/dev/null) || continue
   ln -sf "$TOOLPATH" "$SPEECHBIN/$tool"
 done
 
 # wait_for_line <file> <needle>: poll briefly for content that a backgrounded
-# `say` writes asynchronously, since notify_via_macos_speech must return before
-# that write happens. Bounded so a genuine regression fails fast, not hangs.
+# render/play step writes asynchronously, since notify_via_macos_speech must
+# return before that write happens. Bounded so a genuine regression fails
+# fast, not hangs.
 wait_for_line() {  # <file> <needle>
   local file=$1 needle=$2 i=0
   while [ "$i" -lt 40 ]; do
@@ -506,18 +529,75 @@ pass "a real say binary that lacks the configured voice falls back to the named 
 
 : > "$OSA_LOG"
 : > "$SAY_LOG"
+: > "$RENDER_LOG"
 printf 'Zoe (Premium)   en_US   # sample\n' > "$SAY_VOICES"
 START=$(date +%s)
 PATH="$SPEECHBIN:$SAYHOME" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$PRIMARY/state" \
   FM_NOTIFY_CHANNEL=macos env -u FM_NOTIFY_EXEC "$NOTIFY" pr-merged "firstmate: PR merged" "smoke"
 CODE=$?
 END=$(date +%s)
-expect_code 0 "$CODE" "a genuine speech call must still exit 0"
+expect_code 0 "$CODE" "an afplay-unavailable speech call must still exit 0"
 ELAPSED=$((END - START))
 [ "$ELAPSED" -le 2 ] || fail "notify must not block on speech playback (took ${ELAPSED}s)"
 wait_for_line "$SAY_LOG" "one down!" || fail "the detached say process never spoke the configured phrase: $(cat "$SAY_LOG" 2>/dev/null)"
 assert_grep "-v Zoe" "$SAY_LOG" "say must be invoked with the resolved voice"
+[ -s "$RENDER_LOG" ] && fail "no cache render must be attempted when afplay is unavailable"
 [ ! -s "$OSA_LOG" ] || fail "a successful speech call must not also fall back to the named sound"
-pass "an installed voice speaks the phrase in the background without blocking the caller"
+pass "when afplay is unavailable, speech falls back to a live say call with no caching"
+
+# --- speech cache: render once, then reuse without re-rendering ------------
+
+CACHE_HOME=$(make_home "$TMPROOT/cachehome")
+CACHE_STATE="$CACHE_HOME/state"
+
+: > "$OSA_LOG"
+: > "$SAY_LOG"
+: > "$RENDER_LOG"
+: > "$AFPLAY_LOG"
+printf 'Zoe (Premium)   en_US   # sample\n' > "$SAY_VOICES"
+START=$(date +%s)
+PATH="$SPEECHBIN:$AFPLAYHOME" FM_HOME="$CACHE_HOME" FM_STATE_OVERRIDE="$CACHE_STATE" \
+  FM_NOTIFY_CHANNEL=macos env -u FM_NOTIFY_EXEC "$NOTIFY" pr-ready "firstmate: PR ready" "smoke"
+CODE=$?
+END=$(date +%s)
+expect_code 0 "$CODE" "a cache-miss speech call must still exit 0"
+ELAPSED=$((END - START))
+[ "$ELAPSED" -le 2 ] || fail "notify must not block on cache render or playback (took ${ELAPSED}s)"
+wait_for_line "$AFPLAY_LOG" "$CACHE_STATE/.notify-speech-cache/" \
+  || fail "afplay was never invoked against a cache file: $(cat "$AFPLAY_LOG" 2>/dev/null)"
+assert_grep "Ready for review" "$RENDER_LOG" "the cache-miss render must carry the resolved phrase"
+assert_grep "-v Zoe" "$RENDER_LOG" "the cache-miss render must carry the resolved voice"
+CACHED=$(find "$CACHE_STATE/.notify-speech-cache" -type f -name '*.aiff' 2>/dev/null | head -1)
+[ -n "$CACHED" ] && [ -s "$CACHED" ] || fail "the render must leave a non-empty cache file behind"
+[ ! -s "$SAY_LOG" ] || fail "a cache-miss call must play through afplay, never fall back to a live say"
+[ ! -s "$OSA_LOG" ] || fail "a successful cache render must not also fall back to the named sound"
+pass "a cache miss renders the phrase to a file once and plays it back with afplay"
+
+: > "$RENDER_LOG"
+: > "$AFPLAY_LOG"
+START=$(date +%s)
+PATH="$SPEECHBIN:$AFPLAYHOME" FM_HOME="$CACHE_HOME" FM_STATE_OVERRIDE="$CACHE_STATE" \
+  FM_NOTIFY_CHANNEL=macos env -u FM_NOTIFY_EXEC "$NOTIFY" pr-ready "firstmate: PR ready" "smoke"
+CODE=$?
+END=$(date +%s)
+expect_code 0 "$CODE" "a cache-hit speech call must still exit 0"
+ELAPSED=$((END - START))
+[ "$ELAPSED" -le 2 ] || fail "a cache hit must not block either (took ${ELAPSED}s)"
+wait_for_line "$AFPLAY_LOG" "$CACHE_STATE/.notify-speech-cache/" \
+  || fail "a cache hit must still play through afplay: $(cat "$AFPLAY_LOG" 2>/dev/null)"
+[ -s "$RENDER_LOG" ] && fail "a cache hit must never re-render: $(cat "$RENDER_LOG" 2>/dev/null)"
+pass "an identical class/voice/phrase reuses its cache entry instead of re-rendering"
+
+: > "$RENDER_LOG"
+: > "$AFPLAY_LOG"
+printf 'attention=speak\nattention-phrase=A brand new phrase\n' > "$CACHE_HOME/config/notify"
+PATH="$SPEECHBIN:$AFPLAYHOME" FM_HOME="$CACHE_HOME" FM_STATE_OVERRIDE="$CACHE_STATE" \
+  FM_NOTIFY_CHANNEL=macos env -u FM_NOTIFY_EXEC "$NOTIFY" attention "firstmate: decision needed" "smoke"
+CODE=$?
+expect_code 0 "$CODE" "a fresh phrase's speech call must still exit 0"
+wait_for_line "$RENDER_LOG" "A brand new phrase" \
+  || fail "a config-changed phrase must miss the old cache key and render fresh: $(cat "$RENDER_LOG" 2>/dev/null)"
+pass "editing a class's phrase in config/notify automatically misses the old cache entry and renders a new one"
+rm -f "$CACHE_HOME/config/notify"
 
 echo "# fm-notify.test.sh: all assertions passed"
