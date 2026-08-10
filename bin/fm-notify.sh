@@ -81,24 +81,35 @@
 #   attention  Sosumi                request
 #
 # Speech. When a class resolves to speak mode (the default, or an explicit
-# `speak` value), the macOS leg runs `say -v <voice> <phrase>` instead of
-# playing a named sound; herdr keeps its fixed sound regardless, since its CLI
-# has no speech mode. Every spoken phrase - the captain-chosen default or a
-# configured <class>-phrase - is wrapped with speech-lead-ms of silence before
-# it and speech-tail-ms after, as macOS speech commands (`[[slnc <ms>]]`),
-# because the audio device is still waking on the first syllable and real
-# playback can clip the tail even when a rendered file measures clean silence
-# there - the device's own buffer drains before it. That padding lives in
-# config, not in the phrase text, so retuning it is a config edit, never a
-# code or wording change. A configured voice, phrase, or padding value outside
-# its safe shape is refused and the default is used, the same as an
-# unrecognized sound name. Speech never blocks the caller: `say` runs detached
-# in the background, stdin closed, under the same FM_NOTIFY_TIMEOUT_SECS bound
-# as every other channel call, so a hung process cannot accumulate and a merge
-# or supervision cycle never waits on it. Fail-soft applies throughout: no
-# `say` binary, an unrecognized or not-installed voice, or a background launch
-# failure for any reason all fall back to that class's named-sound behavior
-# rather than going silent.
+# `speak` value), the macOS leg plays a spoken phrase instead of a named
+# sound; herdr keeps its fixed sound regardless, since its CLI has no speech
+# mode. Every spoken phrase - the captain-chosen default or a configured
+# <class>-phrase - is wrapped with speech-lead-ms of silence before it and
+# speech-tail-ms after, as macOS speech commands (`[[slnc <ms>]]`), because
+# the audio device is still waking on the first syllable and needs real
+# runway to drain at the end. Padding lives in config, not in the phrase
+# text, so retuning it is a config edit, never a code or wording change.
+#
+# The padded phrase is rendered once per distinct (class, voice, phrase) with
+# `say -v <voice> -o <file>` into a cache file under
+# state/.notify-speech-cache/, keyed by a checksum of the voice and phrase so
+# a config edit always misses the old entry and renders a fresh one with no
+# separate "regenerate" step. Playback then runs through `afplay <file>`
+# rather than a live `say` speaking straight to the device: `afplay` exists
+# purely to play a complete file and only exits once it has, avoiding the
+# real-hardware clipping a live `say` process can cause by exiting - and
+# closing the device - before its own audio buffer has fully drained, which a
+# rendered file's measured silence cannot detect or fix. When `afplay` is
+# unavailable, speech falls back to a live `say -v <voice> <phrase>` call
+# with no caching. A configured voice, phrase, or padding value outside its
+# safe shape is refused and the default is used, the same as an unrecognized
+# sound name. Speech never blocks the caller: the render-on-miss and the
+# play both run detached in the background, stdin closed, under the same
+# FM_NOTIFY_TIMEOUT_SECS bound as every other channel call, so a hung process
+# cannot accumulate and a merge or supervision cycle never waits on it.
+# Fail-soft applies throughout: no `say` binary, an unrecognized or
+# not-installed voice, or a background launch failure for any reason all fall
+# back to that class's named-sound behavior rather than going silent.
 #
 # Test seam: FM_NOTIFY_EXEC replaces every real channel. The special value
 # `discard` fires nothing; any other value is run as
@@ -126,6 +137,8 @@ NOTIFY_ONCE_TTL_DAYS=${FM_NOTIFY_ONCE_TTL_DAYS:-30}
 case "$NOTIFY_ONCE_TTL_DAYS" in ''|*[!0-9]*) NOTIFY_ONCE_TTL_DAYS=30 ;; esac
 NOTIFY_TIMEOUT_SECS=${FM_NOTIFY_TIMEOUT_SECS:-10}
 case "$NOTIFY_TIMEOUT_SECS" in ''|*[!0-9]*|0) NOTIFY_TIMEOUT_SECS=10 ;; esac
+NOTIFY_SPEECH_CACHE_TTL_DAYS=${FM_NOTIFY_SPEECH_CACHE_TTL_DAYS:-90}
+case "$NOTIFY_SPEECH_CACHE_TTL_DAYS" in ''|*[!0-9]*) NOTIFY_SPEECH_CACHE_TTL_DAYS=90 ;; esac
 
 notify_log() {
   printf 'fm-notify: %s\n' "$1" >&2
@@ -430,6 +443,34 @@ notify_via_herdr() {  # <sound> <title> <body>
   return 1
 }
 
+# A live `say -v voice text` speaking straight to the audio device can have
+# its process exit - and the device close - before the driver's own buffer
+# has fully drained, clipping the tail on real hardware even though a
+# rendered file measures clean trailing silence. A cached, pre-rendered file
+# played back with `afplay` sidesteps that: `afplay` exists purely to play a
+# complete file and only exits once it has, and there is no synthesis-time
+# race against the device.
+notify_speech_cache_dir() {
+  printf '%s/.notify-speech-cache' "$STATE"
+}
+
+# A deterministic filename for one exact (class, voice, padded phrase)
+# combination, so a captain's edit to voice, phrase, or padding in
+# config/notify always misses the old cache entry and renders a fresh one -
+# there is no separate "regenerate" step to remember to run.
+notify_speech_cache_path() {  # <class> <voice> <phrase>
+  local class=$1 voice=$2 phrase=$3 key
+  key=$(printf '%s\x1e%s' "$voice" "$phrase" | cksum | awk '{print $1}')
+  printf '%s/%s.%s.aiff' "$(notify_speech_cache_dir)" "$class" "$key"
+}
+
+# Delete cache entries untouched for FM_NOTIFY_SPEECH_CACHE_TTL_DAYS, the same
+# lazy bounded-without-a-teardown-hook shape as notify_once_claim's pruning.
+notify_speech_cache_prune() {
+  find "$(notify_speech_cache_dir)" -maxdepth 1 -type f -name '*.aiff' \
+    -mtime "+$NOTIFY_SPEECH_CACHE_TTL_DAYS" -delete 2>/dev/null || true
+}
+
 # 0 when <voice> appears as an installed macOS voice name. Bounded the same as
 # every other channel call, so a wedged `say -v '?'` cannot hang the caller.
 notify_voice_installed() {  # <voice>
@@ -445,14 +486,20 @@ notify_voice_installed() {  # <voice>
   printf '%s\n' "$list" | awk '{print $1}' | grep -Fxq "$voice"
 }
 
-# Speak <phrase> in <voice> for <class>, falling back to that class's named
-# sound when `say` is missing, the voice is not installed, or the exec-override
-# test seam reports failure. The real `say` call is launched detached in a
-# subshell so this function - and therefore the caller - returns immediately;
-# notify_run_bounded still applies FM_NOTIFY_TIMEOUT_SECS to the detached
-# process so a hung `say` cannot accumulate.
+# Speak <phrase> in <voice> for <class>: play a cached pre-rendered file with
+# `afplay` when one exists or can be rendered, fall back to live `say` when
+# `afplay` is unavailable, and fall back to that class's named sound when
+# `say` itself is missing, the voice is not installed, or the exec-override
+# test seam reports failure. Everything after the pre-flight checks - the
+# render-on-miss, and the play - runs detached in a single backgrounded
+# subshell so this function, and therefore the caller, returns immediately;
+# notify_run_bounded still applies FM_NOTIFY_TIMEOUT_SECS to each step so a
+# hung render or playback cannot accumulate. The render writes to a per-call
+# temp file and only `mv`s it into the cache path on success, so two
+# concurrent misses for the same key can never leave a corrupt or partial
+# cache entry behind.
 notify_via_macos_speech() {  # <voice> <phrase> <class> <title> <body>
-  local voice=$1 phrase=$2 class=$3 title=$4 body=$5 rc
+  local voice=$1 phrase=$2 class=$3 title=$4 body=$5 rc cachefile
   notify_exec_override macos "speak:$voice:$phrase" "$title" "$body"
   rc=$?
   [ "$rc" -eq 2 ] || return "$rc"
@@ -466,7 +513,32 @@ notify_via_macos_speech() {  # <voice> <phrase> <class> <title> <body>
     notify_via_macos "$(notify_default_sound "$class")" "$title" "$body"
     return $?
   }
-  ( notify_run_bounded say -v "$voice" "$phrase" </dev/null & )
+  if ! command -v afplay >/dev/null 2>&1; then
+    ( notify_run_bounded say -v "$voice" "$phrase" </dev/null & )
+    return 0
+  fi
+  cachefile=$(notify_speech_cache_path "$class" "$voice" "$phrase")
+  mkdir -p "$(notify_speech_cache_dir)" 2>/dev/null || true
+  notify_speech_cache_prune
+  (
+    {
+      cache="$cachefile"
+      if [ ! -s "$cache" ]; then
+        tmp="$cache.$$.tmp"
+        notify_run_bounded say -v "$voice" -o "$tmp" "$phrase" </dev/null
+        if [ -s "$tmp" ]; then
+          mv -f "$tmp" "$cache" 2>/dev/null
+        else
+          rm -f "$tmp" 2>/dev/null
+        fi
+      fi
+      if [ -s "$cache" ]; then
+        notify_run_bounded afplay "$cache" </dev/null
+      else
+        notify_run_bounded say -v "$voice" "$phrase" </dev/null
+      fi
+    } &
+  )
   return 0
 }
 

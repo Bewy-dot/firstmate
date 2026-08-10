@@ -151,12 +151,15 @@ macOS wins even inside herdr because a spoken phrase or a named system sound is 
 Sounds are named macOS system sounds and default to `Glass` for `pr-merged`, `Ping` for `pr-ready`, and `Sosumi` for `attention`; a value that is not a plain sound name is refused and the default is used.
 Herdr sounds are fixed per class (`done`, `done`, `request`) because the CLI accepts only three values, and herdr never speaks.
 
-By default (or with the explicit value `speak`), the macOS leg speaks a phrase with `say` instead of playing a named sound; a class explicitly configured with a sound name keeps that pre-speech behavior unchanged.
-Every spoken phrase - the captain-chosen default or a configured `<class>-phrase` - is wrapped with `speech-lead-ms` of silence before it and `speech-tail-ms` after, as macOS speech commands (`[[slnc <ms>]]`), because the audio device is still waking on the first syllable and real playback can clip the tail even when a rendered file measures clean silence there.
+By default (or with the explicit value `speak`), the macOS leg speaks a phrase instead of playing a named sound; a class explicitly configured with a sound name keeps that pre-speech behavior unchanged.
+Every spoken phrase - the captain-chosen default or a configured `<class>-phrase` - is wrapped with `speech-lead-ms` of silence before it and `speech-tail-ms` after, as macOS speech commands (`[[slnc <ms>]]`), because the audio device is still waking on the first syllable and needs real runway to drain at the end.
 That padding lives in config, not in the phrase text, so retuning it is a config edit, never a code or wording change.
+The padded phrase is rendered once per distinct class/voice/phrase into a cache file under `state/.notify-speech-cache/`, keyed by a checksum so a config edit always misses the old entry and renders a fresh one automatically.
+Playback runs through `afplay` against that cache file rather than a live `say` speaking straight to the device: a rendered file's measured silence cannot prove real playback won't still clip, because a live `say` process can exit - and close the device - before its own audio buffer has fully drained, while `afplay` exists purely to play a complete file and only exits once it has.
+When `afplay` is unavailable, speech falls back to a live `say -v <voice> <phrase>` call with no caching.
 A configured voice, phrase, or padding value outside its safe shape is refused and the default is used, the same as an unrecognized sound name.
-Speech never blocks the caller - `say` runs detached in the background with stdin closed - and falls back to that class's named-sound behavior whenever `say` is missing, the configured voice is not installed, or the background launch fails for any reason.
-See `bin/fm-notify.sh`'s header for the exact speech mechanics, the execution-seam contract, and the manual smoke commands.
+Speech never blocks the caller - the render-on-miss and the play both run detached in the background with stdin closed - and falls back to that class's named-sound behavior whenever `say` is missing, the configured voice is not installed, or the background launch fails for any reason.
+See `bin/fm-notify.sh`'s header for the exact speech and caching mechanics, the execution-seam contract, and the manual smoke commands.
 
 This is separate from the away-mode wedge alarm ([`wedge-alarm.md`](wedge-alarm.md)), which stays a louder, rate-limited alert for a supervision channel that has genuinely wedged.
 
