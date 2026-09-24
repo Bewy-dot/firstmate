@@ -303,6 +303,15 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
+fm_lock_steal_marker_is_stale() {
+  local steal=$1 spid
+  { [ -e "$steal" ] || [ -L "$steal" ]; } || return 1
+  spid=$(cat "$steal/pid" 2>/dev/null || true)
+  fm_pid_alive "$spid" && return 1
+  fm_lock_mid_acquire_is_fresh "$steal" "$spid" && return 1
+  return 0
+}
+
 fm_lock_try_acquire() {
   local lockdir=$1 pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
@@ -310,6 +319,13 @@ fm_lock_try_acquire() {
 
   if fm_lock_try_create "$lockdir"; then
     return 0
+  fi
+
+  if ! { [ -e "$lockdir" ] || [ -L "$lockdir" ]; }; then
+    # Create failed but left nothing behind: an I/O failure (e.g. ENOSPC),
+    # not contention with another holder. Fail fast without attempting a
+    # steal, so a full disk cannot drive unbounded ".steal" recursion.
+    return 1
   fi
 
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
@@ -322,11 +338,21 @@ fm_lock_try_acquire() {
     return 1
   fi
 
+  # A steal marker is never itself stolen through recursion: if a marker is
+  # already there, at most one stale-recovery retry runs, never a nested
+  # acquire. This bounds depth at one regardless of why creating it failed
+  # (live contention, a stale dead-pid marker, or an I/O failure), so no
+  # failure mode can chain into ".steal.steal.steal...".
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
-    FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
-    FM_LOCK_OWNER_DIR=
-    return 1
+  if ! fm_lock_try_create "$steal"; then
+    if fm_lock_steal_marker_is_stale "$steal"; then
+      fm_lock_remove_path "$steal" || true
+    fi
+    if ! fm_lock_try_create "$steal"; then
+      FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
+      FM_LOCK_OWNER_DIR=
+      return 1
+    fi
   fi
   steal_owner=${FM_LOCK_OWNER_DIR:-}
 

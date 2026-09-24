@@ -259,6 +259,107 @@ test_lock_stale_steal_single_winner_under_concurrency() {
   pass "concurrent stale-lock steal yields exactly one winner"
 }
 
+# Regression for the 2026-09-24 incident: a full data volume made every lock
+# create fail with no lockdir ever appearing, and the old code mistook that for
+# ordinary contention, recursing into ".steal", ".steal.steal", ".steal.steal.steal"
+# forever until basename choked on the path length. Simulates the same "create
+# can never succeed" shape with a read-only state directory instead of a full
+# disk, and asserts the acquire fails once, quietly, with no steal chain at all.
+test_lock_create_failure_is_bounded_not_recursive() {
+  local dir state lockdir out err rc steal_count
+  dir=$(make_case lock-create-failure)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  chmod 0500 "$state"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$lockdir" 2>"$dir/stderr")
+  err=$(cat "$dir/stderr" 2>/dev/null || true)
+  chmod 0700 "$state"
+  case "$out" in
+    *"rc=1"*) ;;
+    *) fail "acquire on an unwritable state dir should fail, not succeed: $out" ;;
+  esac
+  [ -z "$err" ] || fail "acquire on an unwritable state dir spammed stderr: $err"
+  { [ -e "$lockdir" ] || [ -L "$lockdir" ]; } && fail "a lock path appeared despite the state dir being unwritable"
+  steal_count=$(find "$dir" -name '*.steal*' 2>/dev/null | wc -l | tr -d ' ')
+  [ "$steal_count" -eq 0 ] || fail "create failure produced steal marker(s) instead of failing fast: $steal_count found"
+  pass "a create failure (no lockdir, no contention) fails fast without a steal chain"
+}
+
+# Regression for the same incident's second recursion point: once the primary
+# lock is a genuine dead-pid stale lock, the old code recursed into stealing the
+# steal marker itself whenever creating IT also failed. Simulates that by
+# pre-creating a dead-pid lockdir, then making the state directory unwritable so
+# only the ".steal" creation fails; asserts a single non-recursive busy result,
+# never a chain of nested steal markers.
+test_lock_steal_create_failure_does_not_chain() {
+  local dir state lockdir dead out err rc steal_chain_count
+  dir=$(make_case lock-steal-create-failure)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  chmod 0500 "$state"
+  out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$lockdir" 2>"$dir/stderr")
+  err=$(cat "$dir/stderr" 2>/dev/null || true)
+  chmod 0700 "$state"
+  case "$out" in
+    *"rc=1"*) ;;
+    *) fail "acquire should stay busy when the steal marker cannot be created: $out" ;;
+  esac
+  case "$out" in
+    *"held=$dead"*) ;;
+    *) fail "acquire did not report the stale primary lock's pid as held: $out" ;;
+  esac
+  [ -z "$err" ] || fail "steal-create failure spammed stderr: $err"
+  steal_chain_count=$(find "$dir" -name '*.steal.steal*' 2>/dev/null | wc -l | tr -d ' ')
+  [ "$steal_chain_count" -eq 0 ] || fail "steal-create failure produced a nested steal chain: $steal_chain_count found"
+  pass "a steal-marker create failure is a single non-recursive busy result"
+}
+
+# Companion to test_lock_steal_create_failure_does_not_chain: a genuinely
+# stale ".steal" marker (its own owner died mid-steal, e.g. between creating
+# the marker and finishing the steal) must still be recoverable - just once,
+# never via recursion. Pre-creates both a dead-pid primary lock and a
+# dead-pid steal marker, and asserts the acquirer wins in a single retry
+# with no nested ".steal.steal" ever appearing.
+test_lock_recovers_stale_steal_marker() {
+  local dir state lockdir dead out err rc newpid steal_chain_count
+  dir=$(make_case lock-stale-steal-recovery)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  mkdir "$lockdir.steal"
+  printf '%s\n' "$dead" > "$lockdir.steal/pid"
+  out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s pid=%s\n" "$rc" "$(cat "$2/pid" 2>/dev/null || true)"
+  ' _ "$LIB" "$lockdir" 2>"$dir/stderr")
+  err=$(cat "$dir/stderr" 2>/dev/null || true)
+  case "$out" in
+    *"rc=0"*) ;;
+    *) fail "acquirer failed to recover a stale dead-pid steal marker: $out" ;;
+  esac
+  newpid=${out#*pid=}; newpid=${newpid%% *}
+  [ -n "$newpid" ] && [ "$newpid" != "$dead" ] || fail "stale lock was not reclaimed after steal-marker recovery: $out"
+  [ -z "$err" ] || fail "stale steal-marker recovery spammed stderr: $err"
+  [ ! -e "$lockdir.steal" ] || fail "stale steal marker was left behind after a successful acquire"
+  steal_chain_count=$(find "$dir" -name '*.steal.steal*' 2>/dev/null | wc -l | tr -d ' ')
+  [ "$steal_chain_count" -eq 0 ] || fail "stale steal-marker recovery produced a nested steal chain: $steal_chain_count found"
+  pass "a stale dead-pid steal marker is recovered once, never via recursion"
+}
+
 test_lock_live_steal_mutex_is_not_reclaimed() {
   local dir state lockdir dead holder_file holder out i lockpid stealpid
   dir=$(make_case lock-live-stealer)
@@ -1031,6 +1132,9 @@ test_guard_warnings
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
+test_lock_create_failure_is_bounded_not_recursive
+test_lock_steal_create_failure_does_not_chain
+test_lock_recovers_stale_steal_marker
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
