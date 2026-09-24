@@ -312,6 +312,13 @@ fm_lock_try_acquire() {
     return 0
   fi
 
+  if ! { [ -e "$lockdir" ] || [ -L "$lockdir" ]; }; then
+    # Create failed but left nothing behind: an I/O failure (e.g. ENOSPC),
+    # not contention with another holder. Fail fast without attempting a
+    # steal, so a full disk cannot drive unbounded ".steal" recursion.
+    return 1
+  fi
+
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   if fm_pid_alive "$pid"; then
     FM_LOCK_HELD_PID=$pid
@@ -322,8 +329,12 @@ fm_lock_try_acquire() {
     return 1
   fi
 
+  # A steal marker is a single non-recursive attempt: it is never itself
+  # stolen. This bounds recursion depth at one regardless of why creating
+  # it failed (live contention or an I/O failure), so an existing failure
+  # mode can never chain into ".steal.steal.steal...".
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! fm_lock_try_create "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1
