@@ -325,6 +325,41 @@ test_lock_steal_create_failure_does_not_chain() {
   pass "a steal-marker create failure is a single non-recursive busy result"
 }
 
+# Companion to test_lock_steal_create_failure_does_not_chain: a genuinely
+# stale ".steal" marker (its own owner died mid-steal, e.g. between creating
+# the marker and finishing the steal) must still be recoverable - just once,
+# never via recursion. Pre-creates both a dead-pid primary lock and a
+# dead-pid steal marker, and asserts the acquirer wins in a single retry
+# with no nested ".steal.steal" ever appearing.
+test_lock_recovers_stale_steal_marker() {
+  local dir state lockdir dead out err rc newpid steal_chain_count
+  dir=$(make_case lock-stale-steal-recovery)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  mkdir "$lockdir.steal"
+  printf '%s\n' "$dead" > "$lockdir.steal/pid"
+  out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s pid=%s\n" "$rc" "$(cat "$2/pid" 2>/dev/null || true)"
+  ' _ "$LIB" "$lockdir" 2>"$dir/stderr")
+  err=$(cat "$dir/stderr" 2>/dev/null || true)
+  case "$out" in
+    *"rc=0"*) ;;
+    *) fail "acquirer failed to recover a stale dead-pid steal marker: $out" ;;
+  esac
+  newpid=${out#*pid=}; newpid=${newpid%% *}
+  [ -n "$newpid" ] && [ "$newpid" != "$dead" ] || fail "stale lock was not reclaimed after steal-marker recovery: $out"
+  [ -z "$err" ] || fail "stale steal-marker recovery spammed stderr: $err"
+  [ ! -e "$lockdir.steal" ] || fail "stale steal marker was left behind after a successful acquire"
+  steal_chain_count=$(find "$dir" -name '*.steal.steal*' 2>/dev/null | wc -l | tr -d ' ')
+  [ "$steal_chain_count" -eq 0 ] || fail "stale steal-marker recovery produced a nested steal chain: $steal_chain_count found"
+  pass "a stale dead-pid steal marker is recovered once, never via recursion"
+}
+
 test_lock_live_steal_mutex_is_not_reclaimed() {
   local dir state lockdir dead holder_file holder out i lockpid stealpid
   dir=$(make_case lock-live-stealer)
@@ -1099,6 +1134,7 @@ test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_create_failure_is_bounded_not_recursive
 test_lock_steal_create_failure_does_not_chain
+test_lock_recovers_stale_steal_marker
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
