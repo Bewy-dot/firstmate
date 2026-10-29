@@ -1,14 +1,14 @@
 # Crew board and pane labels
 
-Firstmate keeps `data/board.md` as a compact, local view of work, with a persistent terminal pane beside firstmate in Herdr.
-The board is a presentation of the canonical fleet snapshot used by bearings, including structured backlog decisions and the registered secondmate summaries.
+Firstmate keeps a terminal board in a persistent pane beside firstmate in Herdr, with `data/board.md` as its plain-text fallback.
+The board is a presentation of the canonical fleet snapshot used by bearings, including structured backlog decisions and each local second mate's own home snapshot.
 It makes no additional GitHub calls and does not authorize an action or change task state.
 
 The existing supervision loop and status-surfacing path refresh the presentation automatically.
 The board viewer also checks for changes between supervision cycles, with a 30-second backstop for CI or secondmate state that changes without a local status event.
 Run `bin/fm-board.sh refresh` from the firstmate pane to initialize or restore it immediately.
 Pane operations safely do nothing on other backends; `bin/fm-board.sh render` can still generate the Markdown file there.
-Python 3 with its standard curses module is required for the terminal viewer.
+The viewer needs only Python 3 and its standard library, with no third-party package to install.
 
 ## Reading the labels
 
@@ -51,10 +51,38 @@ Branches name their prerequisites explicitly rather than implying a sequence bet
 Missing prerequisites and dependency cycles remain visible.
 The compact summary shows one PR URL per group and counts any additional PRs in the full detail file.
 
-The terminal view uses a fixed title bar, coloured section headings without Markdown heading markers, spacing, wrapped text, and a visible scrollbar showing position and viewport size.
-Scroll with `j`/`k`, arrow keys, Page Up/Page Down, Home, and End; `f` switches between the summary and full detail, and `q` exits the viewer.
-The footer shows the visible line range and navigation keys.
-It updates the terminal's changed cells rather than clearing and repainting the display.
+## Terminal board
+
+![The previous text board beside the terminal board's summary and full views, on live data](images/crew-board-before-after.png)
+
+The pane draws `state/board-model.json`, the structured projection written by every render, in the colours of a Catppuccin Mocha terminal.
+Pills like the Herdr and WezTerm tab bar carry the counts and each item's kind, and the default view stays within 34 lines whatever the inventory.
+Yellow and peach mean the item needs you, green means ready to merge or done, blue means running, and grey means waiting, queued, or parked.
+Mauve marks links and the selected item, and red appears only for a genuine failure.
+Every state also has a word and an icon, so colour is never the only signal.
+
+The default view shows up to five items that need you, with the selected one expanded to its question, links, and pane location.
+Below them, each group in motion is one line with its dependency chain drawn as connected icons, then three summary lines for queued decisions, parked work, and recent completions.
+`f` switches to the full view, where every item is expanded and every chain is drawn as a vertical rail with dashed connectors for waiting steps.
+
+Keys:
+
+- `j` and `k`, or the arrow keys, move the selection, and PageUp, PageDown, Home, and End scroll.
+- Enter goes to the selected worker's pane.
+- `o` opens its pull request, or its brief when it has none.
+- `b` opens the brief, and `r` opens the report.
+- `f` switches between the summary and the full view, and `q` exits.
+
+PR, brief, report, and detail links are also OSC 8 hyperlinks, so a terminal that supports them can click through.
+A brief, report, or detail file inside an Obsidian vault opens as an `obsidian://open?vault=<folder name>&file=<path>` link, found from the nearest `.obsidian` folder above the file; any other file opens directly.
+`bin/fm-board.sh view --once --width 60` prints one frame and exits, and `--select N` and `--detail` choose the selection and the full view.
+
+Glyphs use Nerd Font powerline and icon characters, which WezTerm bundles.
+Set `FM_BOARD_ICONS=plain`, or put `plain` in `config/board-icons`, for plain Unicode on a terminal without that font.
+`NO_COLOR` removes colour and implies plain glyphs.
+The viewer writes truecolor escape sequences, so it needs a terminal that supports them.
+
+The viewer updates only the screen rows that changed rather than clearing and repainting the display.
 The adjacent split stays in firstmate's current tab without taking focus.
 Repeated refreshes reuse the same home-specific pane; closing it allows a subsequent supervision refresh to recreate it.
 If that pane was moved to another tab, refresh refuses to create a duplicate; return it beside firstmate or close it for recreation.
@@ -62,6 +90,26 @@ This is a persistent split, not a separate workspace or an Obsidian page.
 The adapter verifies firstmate's live pane, tab, workspace, and session socket before creating anything.
 Missing or contradictory identity refuses placement instead of guessing by workspace label.
 The viewer environment is stored in a generated mode-0700 script under `state/`, and only its short launch command is sent after the shell prompt is ready.
+
+## Going to a worker
+
+Herdr has no URL scheme and cannot focus a pane by id, and `pane focus` only moves in a direction.
+`herdr tab focus` does select the tab and its workspace, and each task owns a one-pane tab, so focusing the tab lands on the worker.
+`bin/fm-goto.sh <task-id>` does exactly that.
+It finds the task's metadata in this home or in a local second mate's own home, validates the recorded endpoint, confirms the pane still exists, and then focuses its tab.
+It changes focus only, and it does nothing on another backend.
+Enter in the board runs it for the selected item, and the same command can be run from any pane.
+Every item shows the Herdr workspace, tab, and pane that command will use.
+
+## Second mate workers and merged pull requests
+
+For a second mate registered on this machine, the board runs the snapshot in that home and reads its workers and backlog from there, not from the bounded summary in firstmate's snapshot.
+If that home cannot be read, the board falls back to the summary and asks for a state check.
+
+Some harnesses cannot be classified from their pane, so the snapshot reports an unknown state.
+Only in that case, the worker's last status event stands in for it.
+A pause that waits for a merge decision on an open pull request shows as a review request with green checks unconfirmed, and any other pause shows as a wait rather than a blocker.
+A pull request that the records already show as merged is never offered for review or merge, and its worker shows as done.
 
 ## Local group mapping and notes
 
@@ -81,7 +129,7 @@ For example:
 ```
 
 Invalid configuration leaves the existing board intact and prints a diagnostic when refreshed manually.
-Run `bin/fm-board.sh --help` for rendering and offline snapshot-preview commands.
+Run `bin/fm-board.sh --help` for rendering, offline snapshot-preview, and viewer commands.
 Set `FM_BOARD_DISABLED=1` to suppress the board helper, including its automatic calls.
 
 Add personal lines under the final `## My notes` heading in `data/board.md`.
