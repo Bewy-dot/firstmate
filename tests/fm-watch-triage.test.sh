@@ -160,6 +160,7 @@ test_classifier_primitives() {
   printf 'working: a\n\ndone: b\n\n' > "$state/x.status"
   [ "$(last_status_line "$state/x.status")" = "done: b" ] || fail "last_status_line did not return the last non-blank line"
   status_is_captain_relevant "done: b" || fail "done: not recognized as captain-relevant"
+  status_is_captain_relevant "ready-for-merge: checks passed" || fail "ready-for-merge: not captain-relevant"
   status_is_captain_relevant "needs-decision [key=q1]: b" || fail "keyed needs-decision not recognized as captain-relevant"
   status_is_captain_relevant "working: b" && fail "working: wrongly recognized as captain-relevant"
   # Incident regression: free-text "merged" inside a nonterminal working: line must
@@ -456,6 +457,67 @@ test_terminal_stale_surfaced() {
   pass "a stale pane sitting on a terminal status is surfaced (queue + exit)"
 }
 
+# A reconciled finish or decision gate is healthy idle, even across pane churn.
+test_successful_wake_handoff_guard() {
+  local dir state fakebin out pid guard_out
+  dir=$(make_case handoff-guard); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=ship\n' > "$state/task.meta"
+  printf 'needs-decision: choose database\n' > "$state/task.status"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 150 || { reap "$pid"; fail "handoff watcher did not deliver"; }
+  assert_present "$state/.watcher-handoff" "successful delivery must record handoff"
+  guard_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-guard.sh" 2>&1)
+  assert_not_contains "$guard_out" 'WATCHER DOWN' "normal successful wake must not alarm"
+  assert_contains "$guard_out" 'queued wakes pending' "handoff must not hide queued wakes"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1
+  guard_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-guard.sh" 2>&1)
+  [ -z "$guard_out" ] || fail "drained wake handoff must remain quiet during grace: $guard_out"
+  set_mtime "$(( $(date +%s) - 1000 ))" "$state/.watcher-handoff"
+  guard_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-guard.sh" 2>&1)
+  assert_contains "$guard_out" 'WATCHER DOWN' "expired handoff must alarm even with fresh beacon"
+
+  # An unexpected exit of the successor must not reuse the previous handoff.
+  touch "$state/.watcher-handoff"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_live "$pid" 15 || { reap "$pid"; fail "successor watcher did not start"; }
+  assert_absent "$state/.watcher-handoff" "successor must invalidate previous handoff"
+  reap "$pid"
+  guard_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-guard.sh" 2>&1)
+  assert_contains "$guard_out" 'no live watcher or recent wake handoff was verified' "unexpected successor exit must still alarm"
+  pass "successful wake handoff is quiet only during grace; expired and crashed successors alarm"
+}
+
+test_waiting_stale_is_silent() {
+  local verdict dir state fakebin out capture_file window key pid sig
+  for verdict in "done" parked paused; do
+    dir=$(make_case "waiting-$verdict"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-held"
+    printf 'waiting for review' > "$capture_file"
+    printf 'window=%s\nkind=ship\n' "$window" > "$state/held.meta"
+    printf 'done: delivered\n' > "$state/held.status"
+    sig=$(seen_sig "$state/held.status"); printf '%s' "$sig" > "$state/.seen-held_status"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    printf '%s' "$(hash_text 'waiting for review')" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    # A prior working timer must not wedge-escalate a newly finished run.
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    watch_bg "$state" "$fakebin" "$out" env \
+      FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_CREW_STATE="state: $verdict · source: run-step · awaiting captain" \
+      FM_STALE_ESCALATE_SECS=1
+    pid=$!
+    wait_live "$pid" 30 || { reap "$pid"; fail "$verdict crew raised stale: $(cat "$out")"; }
+    printf 'review screen changed' > "$capture_file"
+    wait_live "$pid" 30 || { reap "$pid"; fail "$verdict pane churn raised stale: $(cat "$out")"; }
+    [ ! -s "$out" ] && [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "$verdict idle was not silent"; }
+    [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "$verdict retained a wedge timer"; }
+    reap "$pid"
+  done
+  pass "reconciled done, parked, and paused crews stay silent across pane churn and old wedge timers"
+}
+
 # --- stale pane, STALE terminal status overridden by an active run: absorbed ---
 # Regression for the 2026-07 herdr false-surface incidents: a crew's own status
 # log gets no new entry once firstmate hands it to a no-mistakes validation
@@ -681,10 +743,9 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
 # fm-crew-state then authoritatively reports stopped rather than paused, but the
 # confirmed-dead agent plus the declared wait or captain-held transfer must retain
 # bounded pause handling.
-# A still-live agent at an external-decision gate is the disconfirming case: it
-# must surface once, while the unchanged hash must not append the same wake on
-# every watcher re-arm.
-test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
+# A still-live agent whose authoritative state confirms the pause is healthy
+# idle too; process presence alone must not override that reconciled state.
+test_declared_pause_is_bounded_for_exited_and_idle_agents() {
   local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes bare
   dir=$(make_case exited-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
@@ -708,7 +769,13 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
-    if wait_live "$pid" 15; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
+    if [ "$round" -eq 1 ]; then
+      wait_for_exit "$pid" 150 || fail "dead-agent pause did not reach its bounded recheck"
+    elif wait_live "$pid" 30; then
+      reap "$pid"
+    else
+      wait "$pid" || fail "dead-agent watcher round $round failed"
+    fi
     round=$((round + 1))
   done
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
@@ -753,17 +820,18 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
 
-  # First sight must surface promptly so a live external-decision gate is not
-  # hidden behind the pause cadence.
+  # A reconciled pause is healthy idle even when the worker process is alive;
+  # its initial status signal was already consumed above.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting at an active external-decision gate' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "live external-decision gate did not surface immediately"
+  wait_live "$pid" 30 || { reap "$pid"; fail "reconciled live pause raised stale"; }
+  reap "$pid"
 
   # Re-arm with the stale timer already beyond the wedge threshold. This is the
-  # exact unchanged-hash fallback after the immediate surface: it must retain
+  # unchanged-hash fallback after absorption: it must retain
   # the pause cadence and discard any residual wedge timer instead of emitting
   # a second possible-wedge wake.
   printf '%s\n' $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
@@ -779,11 +847,8 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "live external-decision gate lost its pause cadence marker"; }
   [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "live external-decision gate retained the wedge timer"; }
   reap "$pid"
-  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
-  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
-  [ "$wakes" -eq 1 ] || fail "live external-decision gate should surface once, got $wakes wakes"
-  [ "$bare" -eq 1 ] || fail "live external-decision gate lost its immediate bare stale surface"
-  pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
+  [ ! -s "$state/.wake-queue" ] || fail "reconciled live pause raised a stale wake"
+  pass "exited declared-pause and captain-held panes use bounded rechecks; reconciled live pauses stay idle"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1812,6 +1877,8 @@ test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
+test_successful_wake_handoff_guard
+test_waiting_stale_is_silent
 test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
@@ -1825,7 +1892,7 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
 test_busy_pane_default_turn_age_bound_is_3600s
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
-test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_declared_pause_is_bounded_for_exited_and_idle_agents
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking
