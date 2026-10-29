@@ -139,7 +139,7 @@ family_for_basename() {
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
-    fm-notify.test.sh|fm-board.test.sh|\
+    fm-notify.test.sh|fm-board.test.sh|fm-goto.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
@@ -908,7 +908,7 @@ families_for_changed_path() {
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
       ;;
-    bin/fm-board.sh|bin/fm-board.py)
+    bin/fm-board.sh|bin/fm-board.py|bin/fm_board_tui.py|bin/fm-goto.sh)
       printf '%s\n' pure-contract-unit
       printf '%s\n' real-herdr-gated
       ;;

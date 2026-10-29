@@ -10,8 +10,10 @@ import subprocess
 import sys
 import termios
 import time
+import re
 import tempfile
 import unittest
+import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -220,44 +222,195 @@ class Board(unittest.TestCase):
         self.assertNotIn('Fee schedule [WAITING] -> Plan proposals', self.board())
         self.assertIn('Plan proposals [WAITING] after Recurring billing', self.board())
 
-    def test_terminal_layout_scrollbar_and_detail_navigation(self):
-        self.snap = sequence_fixture()
+    def frame(self, *args, env=None):
+        run_env = dict(self.env, FM_BOARD_DISABLED='1', **(env or {}))
+        out = subprocess.run([sys.executable, str(ROOT / 'bin/fm-board.py'), 'view', '--once', *args],
+                             env=run_env, capture_output=True, text=True, check=True).stdout
+        return out, re.sub(r'\x1b\][^\x1b]*\x1b\\|\x1b\[[0-9;]*m', '', out)
+
+    def test_default_view_is_one_screen_whatever_the_inventory(self):
+        self.snap = fixture()
+        for n in range(40):
+            base = dict(self.snap['tasks'][0], id='answer-' + str(n), backlog=dict(id='answer-' + str(n), repo='continuo', title='Question ' + str(n)))
+            self.snap['tasks'].append(base)
+            self.snap['tasks'].append(dict(base, id='running-' + str(n), hints={}, current_state=dict(state='working', detail='Implementing')))
+        self.snap['fm_home'] = str(self.home)
+        self.run_board()
+        for width in (60, 100):
+            for selected in (0, 5, 50):
+                with self.subTest(width=width, selected=selected):
+                    _, text = self.frame('--width', str(width), '--select', str(selected))
+                    self.assertLessEqual(len(text.splitlines()), 34)
+                    self.assertTrue(all(len(line) <= width for line in text.splitlines()))
+        _, text = self.frame('--width', '60')
+        self.assertIn('+', text.split('Needs you now')[1].split('In motion')[0])
+        _, detail = self.frame('--width', '60', '--detail')
+        self.assertGreater(len(detail.splitlines()), 100)
+
+    def test_terminal_colours_pills_links_and_selection(self):
+        self.snap['fm_home'] = str(self.home)
+        self.snap['tasks'] = [t for t in self.snap['tasks'] if t['id'] != 'build-failed']
+        (self.home / '.obsidian').mkdir()
+        (self.home / 'data/compensation-rules').mkdir(parents=True)
+        (self.home / 'data/compensation-rules/brief.md').write_text('brief')
+        self.run_board()
+        raw, text = self.frame('--width', '70', '--select', '1')
+        self.assertIn('\x1b[38;2;249;226;175m', raw)  # yellow: needs you
+        self.assertIn('\x1b[38;2;250;179;135m', raw)  # peach: apply the database change first
+        self.assertIn('\x1b[38;2;166;227;161m', raw)  # green: ready or done
+        self.assertIn('\x1b[38;2;137;180;250m', raw)  # blue: running
+        self.assertNotIn('243;139;168', raw)           # red is reserved for a failure
+        self.assertIn('\ue0b2', raw)                  # powerline pill caps
+        self.assertIn('Database, then merge', text)
+        self.assertIn('Question for you', text)
+        self.assertIn('\x1b]8;;https://github.com/example/isp/pull/1\x1b\\', raw)
+        self.assertIn('$ bin/fm-goto.sh', text)  # the selected worker shows its command
+        quoted = urllib.parse.quote(self.home.name, safe='')
+        first, _ = self.frame('--width', '70')
+        self.assertIn('obsidian://open?vault=' + quoted + '&file=data%2Fcompensation-rules%2Fbrief', first)
+        plain_raw, plain = self.frame('--width', '70', env=dict(FM_BOARD_ICONS='plain'))
+        self.assertNotIn('\ue0b2', plain_raw)
+        mono_raw, _ = self.frame('--width', '70', env=dict(NO_COLOR='1'))
+        self.assertNotIn('38;2', mono_raw)
+        self.assertNotIn('48;2', mono_raw)
+
+    def test_failure_is_the_only_red(self):
+        self.snap['tasks'] = [t for t in self.snap['tasks'] if t['id'] == 'build-failed']
+        self.snap['tasks'][0]['current_state'] = dict(state='failed', detail='Build failed')
+        self.run_board()
+        raw, text = self.frame('--width', '70')
+        self.assertIn('243;139;168', raw)
+        self.assertIn('Failed', text)
+
+    def test_second_mate_home_is_authoritative_and_merged_prs_are_dropped(self):
+        merged = 'https://github.com/example/isp/pull/17'
+        live = 'https://github.com/example/isp/pull/185'
+        stale = dict(id='mate', freshness=dict(status='fresh'), provenance=dict(summary_valid=False),
+                     endpoints=[dict(id='q6', title='Queue dashboard', repo='isp', state='unknown', pr_url=merged,
+                                     detail='harness state unavailable (unknown codex-unverified)')])
+        self.snap = dict(schema='fm-fleet-snapshot.v1', generated='2026-10-30T08:00:00Z', main_inventory=dict(valid=True),
+                         tasks=[dict(id='mate', kind='secondmate', backend='herdr', endpoint=dict(target='lab:w3:p8', exists=True),
+                                     current_state=dict(state='done', detail='re-read'), pr=dict(url=merged))],
+                         backlog=dict(records=[]), secondmate_current=dict(records=[stale]),
+                         secondmate_landed=dict(records=[dict(id='q4', title='Queue Q4', repo='isp', owner='mate', pr_url=merged,
+                                                              completion=dict(verb='merged', date='2026-10-29'))]))
+        self.run_board()
+        self.assertIn('Queue dashboard [BLOCKED]', self.full())  # the bounded summary alone misreads it
+        def codex(name, pr, event, note):
+            return dict(id=name, kind='ship', project='isp', backend='herdr', endpoint=dict(target='lab:w3:p9', exists=True),
+                        backlog=dict(id=name, title='Worker ' + name, repo='isp'), pr=dict(url=pr),
+                        current_state=dict(state='unknown', source='pane', detail='harness state unavailable (unknown codex-unverified)'),
+                        paths=dict(status_log=dict(last_event=dict(state=event, note=note))))
+        owned = dict(schema='fm-fleet-snapshot.v1', generated='2026-10-30T08:00:00Z', fm_home='/mate', main_inventory=dict(valid=True),
+                     tasks=[codex('q6', live, 'paused', "PR open, waiting for the captain's merge decision"),
+                            codex('switch', None, 'paused', 'waiting for the natural 08:15 run')],
+                     backlog=dict(records=[dict(id='q4', title='Queue Q4', repo='isp', structured=True, state='done',
+                                                completion=dict(verb='merged', date='2026-10-29'), pr_url=merged)]))
+        (self.home / 'mate.json').write_text(json.dumps(owned))
+        self.path.write_text(json.dumps(self.snap))
+        subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render', '--snapshot', str(self.path), '--home-snapshot', 'mate=' + str(self.home / 'mate.json')],
+                       env=self.env, check=True, capture_output=True)
+        board, full = self.board(), self.full()
+        self.assertNotIn('Worker status', full)
+        self.assertNotIn('BLOCKED', board)
+        needs = board.split('## NEEDS YOU NOW')[1].split('## Running')[0]
+        self.assertIn('Worker q6 [REVIEW]', needs)
+        self.assertIn('waiting for your merge decision', needs)
+        self.assertIn(live, needs)
+        self.assertNotIn(merged, board)  # a merged PR is never offered
+        self.assertNotIn('switch', needs)  # a deliberate wait is not a request for you
+        self.assertIn('Worker switch [PAUSED]', full)
+        self.assertIn('Queue Q4 [DONE]', full)
+        model = json.loads((self.home / 'state/board-model.json').read_text())
+        self.assertEqual([i['id'] for i in model['need']], ['q6'])
+        self.assertEqual(model['need'][0]['loc'], dict(workspace='w3', tab='fm-q6', pane='p9'))
+        self.assertEqual(model['need'][0]['goto'], dict(id='q6', home='/mate'))
+        self.assertEqual(model['need'][0]['prs'], [dict(label='PR #185', url=live)])
+
+    def test_merged_pr_never_asks_for_review(self):
+        url = 'https://github.com/example/isp/pull/77'
+        self.snap['tasks'] = [dict(self.snap['tasks'][3], id='shipped', pr=dict(url=url),
+                                   backlog=dict(id='shipped', title='Shipped work', repo='isp', completion=dict(verb='merged', date='2026-10-30')))]
+        self.snap['backlog']['records'].append(dict(id='shipped', title='Shipped work', structured=True, repo='isp', state='done',
+                                                    completion=dict(verb='merged', date='2026-10-30'), pr_url=url))
+        self.run_board()
+        self.assertNotIn(url, self.board())
+        self.assertIn('Shipped work [DONE]', self.full())
+
+    def test_registered_local_second_mate_home_is_read_from_disk(self):
+        mate = self.home / 'mate'
+        (self.home / 'data').mkdir()
+        (self.home / 'state').mkdir()
+        for path in (mate / 'data', mate / 'state'):
+            path.mkdir(parents=True)
+        (mate / '.fm-secondmate-home').touch()
+        (self.home / 'data/backlog.md').write_text('## In flight\n\n## Queued\n\n## Done\n')
+        (self.home / 'data/secondmates.md').write_text(f'- mate - Owns ISP (home: {mate}; scope: ISP; projects: isp; added 2026-10-29)\n')
+        (mate / 'data/backlog.md').write_text('## In flight\n\n## Queued\n- [ ] later - Choose the pilot (repo: isp) (kind: captain) (hold-kind: captain) (hold: Which pilot?)\n\n## Done\n')
+        (self.home / 'state/mate.meta').write_text(f'window=main:fm-mate\nendpoint_task_id=mate\nworktree={mate}\nproject={mate}\nkind=secondmate\nhome={mate}\nprojects=isp\n')
+        subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=dict(self.env, FM_SNAPSHOT_NOW='2026-10-30T08:00:00Z'), check=True, capture_output=True)
+        self.assertIn('Which pilot?', self.full())
+        self.assertIn('Task: mate/later', self.full())
+
+    def test_interactive_viewer_navigates_opens_and_goes(self):
+        home = self.home
+        self.snap['fm_home'] = str(home)
+        (home / 'state').mkdir(exist_ok=True)
+        (home / '.obsidian').mkdir()
+        (home / 'data/compensation-rules').mkdir(parents=True)
+        (home / 'data/compensation-rules/brief.md').write_text('brief')
+        for task in self.snap['tasks']:
+            task['endpoint']['target'] = 'default:w1:pAB'
+        fm_write = (home / 'state/compensation-rules.meta')
+        fm_write.write_text('window=default:w1:pAB\nendpoint_task_id=compensation-rules\nworktree=/w\nproject=/p\nbackend=herdr\n'
+                            'herdr_session=default\nherdr_workspace_id=w1\nherdr_tab_id=w1:tAB\nherdr_pane_id=w1:pAB\n')
+        fakebin = home / 'fakebin'
+        fakebin.mkdir()
+        log = home / 'calls.log'
+        (fakebin / 'herdr').write_text('#!/bin/sh\necho "$*" >> ' + str(log) + '\ncase "$1 $2" in "pane get") echo \'{"result":{"pane":{"pane_id":"w1:pAB","tab_id":"w1:tAB"}}}\';; esac\n')
+        (fakebin / 'herdr').chmod(0o755)
+        (fakebin / 'open-recorder').write_text('#!/bin/sh\necho "$*" >> ' + str(home / 'opened.log') + '\n')
+        (fakebin / 'open-recorder').chmod(0o755)
         self.run_board()
         master, slave = os.openpty()
         self.addCleanup(os.close, master)
         self.addCleanup(os.close, slave)
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 20, 100, 0, 0))
-        process = subprocess.Popen([sys.executable, str(ROOT / 'bin/fm-board.py'), 'view'],
-            stdin=slave, stdout=slave, stderr=slave,
-            env=dict(self.env, FM_BOARD_DISABLED='1', TERM='xterm-256color'))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 60, 100, 0, 0))
+        process = subprocess.Popen([sys.executable, str(ROOT / 'bin/fm-board.py'), 'view'], stdin=slave, stdout=slave, stderr=slave,
+            env=dict(self.env, FM_BOARD_DISABLED='1', TERM='xterm-256color', PATH=str(fakebin) + os.pathsep + os.environ['PATH'],
+                     FM_BOARD_OPEN=str(fakebin / 'open-recorder')))
+
         def stop_viewer():
             if process.poll() is None:
                 process.kill()
             process.wait()
         self.addCleanup(stop_viewer)
+        seen = [b'']
 
         def until(token):
-            output = b''
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
+                if token.encode() in seen[0]:
+                    return seen[0].decode(errors='replace')
                 if select.select([master], [], [], 0.1)[0]:
-                    output += os.read(master, 65536)
-                    if token.encode() in output:
-                        return output.decode(errors='replace')
-            self.fail('Terminal did not render ' + token + ': ' + output.decode(errors='replace'))
+                    seen[0] += os.read(master, 65536)
+            self.fail('Terminal did not render ' + token + ': ' + seen[0].decode(errors='replace'))
 
-        output = until('q exit')
-        self.assertIn('CREW BOARD', output)
-        self.assertIn('█', output)
-        self.assertIn('│', output)
-        self.assertNotIn('## NEEDS YOU NOW', output)
+        until('quit')
+        self.assertIn('Needs you now', seen[0].decode(errors='replace'))
+        os.write(master, b'G')  # Unknown keys are harmless.
         os.write(master, b'f')
-        self.assertIn('Full detail', until('Full detail'))
-        os.write(master, b'G')  # Unknown keys must be harmless.
-        os.write(master, b'j')
-        until('2-')
+        until('Unknown task')  # only the full list reaches the sixth item
+        os.write(master, b'f')
+        os.write(master, b'\x1b[A')
+        os.write(master, b'b')
+        until('Opened Brief')
+        self.assertIn('obsidian://open', (home / 'opened.log').read_text())
+        os.write(master, b'\r')
+        until('Focused compensation-rules')
+        self.assertIn('tab focus w1:tAB', log.read_text())
         os.write(master, b'q')
-        until('1049l')  # Drain terminal output while curses restores the screen.
+        until('1049l')
         self.assertEqual(process.wait(timeout=5), 0)
 
     def test_groups_actions_history_and_notes(self):

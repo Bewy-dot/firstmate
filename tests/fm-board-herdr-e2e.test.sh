@@ -79,7 +79,7 @@ board=$(lab pane list --workspace "$workspace" | jq -r '.result.panes[] | select
 # Verify the process actually renders the file, rather than merely existing.
 rendered=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if lab pane read "$board" --source recent --lines 80 | grep -q 'CREW BOARD'; then rendered=1; break; fi
+  if lab pane read "$board" --source recent --lines 80 | grep -q 'Needs you now'; then rendered=1; break; fi
   sleep 0.2
 done
 [ "$rendered" = 1 ] || fail 'board viewer did not render'
@@ -135,5 +135,26 @@ for state, detail, backlog, expected in [
     assert info['result']['pane']['label'] == 'mate - ' + expected, info
 
 PY
+# fm-goto lands on the worker: Herdr cannot focus a pane by id, so it focuses the owning tab.
+worker_tab=$(lab pane get "$worker" | jq -r '.result.pane.tab_id')
+cat > "$FM_HOME/state/goto-task.meta" <<META
+window=$HERDR_LAB_SESSION:$worker
+endpoint_task_id=goto-task
+worktree=$TMP_ROOT/wt
+project=$TMP_ROOT/project
+backend=herdr
+herdr_session=$HERDR_LAB_SESSION
+herdr_workspace_id=$workspace
+herdr_tab_id=$worker_tab
+herdr_pane_id=$worker
+META
+other_tab=$(lab tab create --workspace "$workspace" --label elsewhere | jq -r '.result.tab.tab_id')
+focused_tab() { lab tab list --workspace "$workspace" | jq -r '.result.tabs[] | select(.focused) | .tab_id'; }
+lab tab focus "$other_tab" >/dev/null
+[ "$(focused_tab)" = "$other_tab" ] || fail 'setup: the other tab should be focused first'
+"$ROOT/bin/fm-goto.sh" goto-task | grep -q 'Focused goto-task' || fail 'fm-goto did not report success'
+[ "$(focused_tab)" = "$worker_tab" ] || fail 'fm-goto did not focus the worker tab'
+lab pane close "$worker" >/dev/null
+"$ROOT/bin/fm-goto.sh" goto-task >/dev/null 2>&1 && fail 'fm-goto must refuse a closed pane'
 export PATH="$original_path"
-pass 'real Herdr: labels, rendered board, adjacent placement, reuse, and closed-pane recovery'
+pass 'real Herdr: labels, rendered board, adjacent placement, reuse, closed-pane recovery, and go-to-pane focus'

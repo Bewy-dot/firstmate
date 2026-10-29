@@ -652,4 +652,4 @@ The shared staleness proof lives in `bin/fm-lock-lib.sh`, which both `fm-teardow
 
 ## Living crew board
 
-See [Crew board and pane labels](crew-board.md) for the pinned Herdr pane, preserved notes, and local group mapping.
+See [Crew board and pane labels](crew-board.md) for the terminal board pane, going to a worker, preserved notes, and local group mapping.
