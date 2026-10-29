@@ -937,6 +937,10 @@ test_no_run_idle_pane_uses_log() {
   local out; out=$(run_crew_state "$d" feat-i)
   assert_contains "$out" "state: parked" "needs-decision log -> parked"
   assert_contains "$out" "source: status-log" "idle pane -> status-log source"
+  printf 'ready-for-merge: checks passed\n' > "$d/state/feat-i.status"
+  out=$(run_crew_state "$d" feat-i)
+  assert_contains "$out" "state: done" "ready-for-merge log -> done"
+  assert_contains "$out" "source: status-log" "idle merge wait -> status-log source"
   pass "no run + idle pane uses the status-log verb"
 }
 

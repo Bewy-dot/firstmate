@@ -235,6 +235,9 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock() {
   out=$(run_hook "$dir" false); status=$?
   expect_code 2 "$status" "hook must block when a fresh beacon has no live watcher lock"
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  touch "$dir/state/.watcher-handoff"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "a successful wake handoff must not permit a blind turn end"
   pass "fm-turnend-guard: blocks when a fresh beacon has no live watcher lock"
 }
 

@@ -42,7 +42,7 @@ FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 # verb-aware: a nonterminal working: or paused: line never becomes captain-relevant
 # merely because its prose contains one of those tokens (for example
 # "working: rebased onto merged #76").
-FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
+FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|ready-for-merge:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
 
 # The deliberate-external-wait verb. A crew (or firstmate steering it) appends
 #   paused: <reason>
@@ -88,7 +88,7 @@ status_is_terminal_verb() {
   [ -n "$line" ] || return 1
   verb=$(status_line_verb "$line")
   case "$verb" in
-    done|needs-decision|blocked|failed) return 0 ;;
+    done|ready-for-merge|needs-decision|blocked|failed) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -110,7 +110,7 @@ status_is_captain_relevant() {
   esac
   if [ -z "${FM_CAPTAIN_RE+x}" ]; then
     case "$verb" in
-      done|needs-decision|blocked|failed) return 0 ;;
+      done|ready-for-merge|needs-decision|blocked|failed) return 0 ;;
     esac
   fi
   printf '%s' "$line" | grep -qiE "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}"
@@ -321,15 +321,16 @@ signal_reason_is_actionable() {  # <file> ...
 #   working - an actively-running no-mistakes step (running/fixing/ci) or a busy
 #             pane; the crew is legitimately mid-work on a static-looking pane
 #             (e.g. waiting on CI);
+#   waiting - a reconciled finish or decision gate; healthy idle.
 #   paused  - the crew's authoritative current state is a declared external-wait
 #             pause (paused:), which is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
+#   none    - none of these, so the wake must surface (a stopped/failed/
 #             torn-down/unknown crew, or an unreadable verdict).
-# One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
+# One fm-crew-state.sh read serves all absorb classes at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
-# run it only on no-verb signal and first-sighting stale paths, never every wake.
+# call it only for candidate no-verb signals or idle stale panes.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id>
   local id=$1 line state src
@@ -337,6 +338,7 @@ crew_absorb_class() {  # <id>
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
+  case "$state" in done|parked) printf 'waiting'; return ;; esac
   if [ "$state" = paused ]; then printf 'paused'; return; fi
   if [ "$state" = working ]; then
     src=${line#*source: }; src=${src%% *}

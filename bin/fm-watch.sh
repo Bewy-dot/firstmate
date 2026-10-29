@@ -2,15 +2,14 @@
 # Firstmate watcher.
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
 # and keeps blocking; it queues and exits only for actionable wakes.
-# The no-verb signal and stale path is absorb-only-when-provably-working: a wake
-# is absorbed only when the crew shows POSITIVE evidence it is still working (an
-# actively-running no-mistakes step, or a backend busy signal), and surfaced
-# otherwise, so a crew that finishes (or stops and waits) without a current
-# working signal is never silently swallowed. A declared external-wait pause is
+# No-verb signals require positive evidence of work to absorb. Stale panes also
+# absorb reconciled done/parked states: waiting for the primary is healthy idle,
+# while a worker stopped without a reconciled finish or gate still surfaces.
+# A declared external-wait pause is
 # the separate idle absorb case and re-surfaces only on its long bounded cadence,
 # although its initial no-verb status signal still surfaces in normal mode.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
-# on every wake. Printed reason lines:
+# on every actionable wake; reconciled healthy waits stay silent. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
 #                          is not provably working, unless afk is active
@@ -21,7 +20,8 @@
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
 #                          re-surface cadence, never as a wedge. Only when neither
-#                          absorb class applies does the log's last line decide:
+#                          absorb class or reconciled done/parked state applies
+#                          does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
@@ -135,8 +135,8 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # threshold, or anything unknown) is written to the durable queue and exits, which
 # is what wakes the LLM through the background-task completion. The same classifier
 # (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
-# daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
-# wake) and never double-triages - and never runs the costly provably-working read.
+# daemon owns triage, so this watcher reverts to one-shot for remaining wakes
+# after filtering reconciled healthy waits.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
@@ -365,8 +365,8 @@ clear_pause_tracking() {  # <window>
 # Reconcile a declared pause or captain-held status with authoritative crew state.
 # Only a confidently dead ordinary crew may recover paused classification after
 # fm-crew-state has fallen back to stopped or unknown.
-pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file class agent_alive
+pause_state_class() {  # <window> <task> [already reconciled class]
+  local win=$1 task=$2 class=${3:-} key last recheck_file agent_alive
   key=${win//:/_}
   key=${key//\//_}
   key=${key//./_}
@@ -374,7 +374,7 @@ pause_state_class() {  # <window> <task>
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused_or_captain_held "$last"; then
     rm -f "$recheck_file"
-    crew_absorb_class "$task"
+    if [ -n "$class" ]; then printf '%s' "$class"; else crew_absorb_class "$task"; fi
     return
   fi
   if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
@@ -389,7 +389,7 @@ pause_state_class() {  # <window> <task>
     printf 'paused'
     return
   fi
-  class=$(crew_absorb_class "$task")
+  [ -n "$class" ] || class=$(crew_absorb_class "$task")
   if [ "$class" = working ]; then
     rm -f "$recheck_file"
     printf 'working'
@@ -740,6 +740,9 @@ watcher_cleanup() {
   fm_custom_check_snapshot_cleanup
   fm_lock_release "$WATCH_LOCK"
 }
+# A new watcher invalidates the previous successful wake handoff before doing
+# any work, so a subsequent crash cannot borrow that cycle's grace window.
+rm -f "$STATE/.watcher-handoff"
 trap watcher_cleanup EXIT
 trap 'exit 1' HUP INT TERM
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
@@ -965,11 +968,22 @@ EOF
       if [ "$n" -ge 2 ] && [ "$busy_now" -ne 0 ]; then
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
+        stale_class=$(crew_absorb_class "$task")
         if [ "$kind" = secondmate ]; then
-          case "$(pause_state_class "$w" "$task")" in
+          case "$(pause_state_class "$w" "$task" "$stale_class")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;
             *)      clear_pause_tracking "$w" ;;
           esac
+        elif [ "$stale_class" = waiting ]; then
+          # Current-state reconciliation outranks event history and old wedge
+          # timers. Recheck even an unchanged hash so a run that finishes while
+          # its pane stays static cannot inherit a working escalation timer.
+          printf '%s' "$h" > "$sf"
+          rm -f "$ssf" "$ewf"
+          clear_pause_state "$w"
+          triage_log "absorbed stale (healthy waiting): $w"
+        elif [ "$stale_class" = paused ] && ! afk_present; then
+          handle_paused_stale "$w" "$task" "$h"
         elif afk_present; then
           # Daemon owns triage: one-shot per distinct stale hash, as before.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
@@ -993,7 +1007,7 @@ EOF
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            if [ "$stale_class" = working ]; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
@@ -1031,7 +1045,7 @@ EOF
           #     wait out the timer.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
-            case "$(pause_state_class "$w" "$task")" in
+            case "$(pause_state_class "$w" "$task" "$stale_class")" in
               working)
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
@@ -1048,7 +1062,7 @@ EOF
           else
             task=$(window_to_task "$w" "$STATE")
             if [ -e "$pf" ] || status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
-              case "$(pause_state_class "$w" "$task")" in
+              case "$(pause_state_class "$w" "$task" "$stale_class")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"

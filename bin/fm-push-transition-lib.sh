@@ -91,6 +91,9 @@ wake() {
   [ -z "$FM_WAKE_POST_OUTPUT_ACTION" ] || trap '' PIPE
   if echo "$1"; then
     output_status=0
+    # A successful actionable exit transfers control to the primary. The
+    # pull guard grants this handoff a bounded grace; turn-end stays strict.
+    touch "$STATE/.watcher-handoff"
     watch_delivery_publish "$1" || true
   else
     output_status=1

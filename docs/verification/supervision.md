@@ -241,6 +241,35 @@ tests/fm-claude-stop-autoarm.test.sh
 tests/fm-turnend-guard.test.sh
 ```
 
+### Healthy waiting and wake handoffs
+
+Portable regression coverage was refreshed on 2026-10-29 with macOS 26.5.2, Bash 3.2.57, and ShellCheck 0.11.0, using isolated temporary homes.
+The current behavior owners are `bin/fm-crew-state.sh`, `bin/fm-watch.sh`, and the pull-warning handoff predicate in `bin/fm-supervision-lib.sh`.
+These checks exercise shared state and filesystem boundaries rather than new vendor-rendered harness signals.
+
+```sh
+bash tests/fm-crew-state.test.sh
+bash tests/fm-watch-triage.test.sh
+bash tests/fm-guard-stale-banner.test.sh
+bash tests/fm-turnend-guard.test.sh
+bash tests/fm-watcher-lock.test.sh
+bash tests/fm-watch-arm.test.sh
+bash tests/fm-watch-checkpoint.test.sh
+bin/fm-lint.sh
+bin/fm-doc-audience-check.sh
+```
+
+Observed regression output includes:
+
+```text
+ok - successful wake handoff is quiet only during grace; expired and crashed successors alarm
+ok - reconciled done, parked, and paused crews stay silent across pane churn and old wedge timers
+ok - a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)
+ok - exited declared-pause and captain-held panes use bounded rechecks; reconciled live pauses stay idle
+fm-lint.sh: ShellCheck 0.11.0 (pinned 0.11.0)
+fm-doc-audience-check: ok surfaces=64 local_links=189
+```
+
 ## Wedge-alarm channels
 
 The two real notification channels were bounded manually on 2026-07-10 on macOS 26.5.2 with Herdr 0.7.3.

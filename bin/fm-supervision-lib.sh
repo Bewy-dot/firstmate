@@ -8,7 +8,8 @@
 # (state/.last-watcher-beat, touched every poll cycle, within the grace window).
 # bin/fm-guard.sh and bin/fm-turnend-guard.sh use fm_watcher_healthy from
 # bin/fm-wake-lib.sh for their warning and block decisions, so a fresh leftover
-# beacon never counts as a live watcher. The status fields here retain the
+# beacon never counts as a live watcher. Only the pull guard also grants the
+# bounded successful-wake handoff defined below. The status fields retain the
 # beacon-age details used in their messages.
 
 # Portable mtime; Linux stat lacks -f, macOS stat lacks -c.
@@ -86,4 +87,19 @@ fm_supervision_needed() {
 fm_supervision_unhealthy() {
   fm_supervision_status "$@"
   [ "$FM_SUP_NEEDED" = true ] && [ "$FM_SUP_WATCHER_FRESH" = false ]
+}
+
+# fm_supervision_handoff_fresh <state-dir> [grace-seconds]
+# Only the pull warning grants a successful watcher wake a bounded handoff.
+# A new watcher clears the marker; a crash, live-but-stuck lock, or lone fresh
+# beacon never qualifies. Turn-end and arm must still require a live watcher.
+fm_supervision_handoff_fresh() {
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} beat handoff now
+  [ ! -d "$state/.watch.lock" ] || return 1
+  beat=$(fm_sup_stat_mtime "$state/.last-watcher-beat") || return 1
+  handoff=$(fm_sup_stat_mtime "$state/.watcher-handoff") || return 1
+  now=$(date +%s)
+  [ "$handoff" -ge "$beat" ] && [ "$handoff" -le "$now" ] \
+    && [ "$((now - beat))" -lt "$grace" ] \
+    && [ "$((now - handoff))" -lt "$grace" ]
 }

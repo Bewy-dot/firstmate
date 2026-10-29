@@ -127,7 +127,7 @@ map_log_state() {  # <line>
     working)        echo working ;;
     needs-decision) echo parked ;;
     blocked)        echo blocked ;;
-    done)           echo "done" ;;
+    done|ready-for-merge) echo "done" ;;
     failed)         echo failed ;;
     *)              echo unknown ;;
   esac

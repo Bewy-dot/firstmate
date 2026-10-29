@@ -8,7 +8,8 @@
 # Then, if a task is in flight (a state/<id>.meta exists) or X-mode relay
 # polling is active (state/x-watch.check.sh exists) and no identity-matched
 # watcher has a liveness beacon (state/.last-watcher-beat, touched every poll
-# cycle) fresh within FM_GUARD_GRACE seconds, prints a loud, clearly delimited
+# cycle) fresh within FM_GUARD_GRACE seconds, and no successful wake handoff
+# is within that grace (bin/fm-supervision-lib.sh), prints a loud, delimited
 # banner so the agent cannot skim past it in the tool output of whatever it was
 # doing - the one channel every harness has. The full banner is emitted once per
 # distinct staleness episode in this FM_HOME (keyed to beacon mtime or absence);
@@ -151,7 +152,8 @@ sources=$FM_SUP_SOURCES
 needed=$FM_SUP_NEEDED
 beacon_desc=$FM_SUP_BEACON_DESC
 watcher_healthy=false
-if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" \
+  || fm_supervision_handoff_fresh "$STATE" "$GRACE"; then
   watcher_healthy=true
 fi
 if [ "$needed" = false ]; then
@@ -194,11 +196,11 @@ if [ "$watcher_healthy" = false ]; then
       printf '●%s\n' "$rule"
       printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
       if [ "$in_flight" -gt 0 ]; then
-        printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
+        printf '●  %s task(s) in flight, but no live watcher or recent wake handoff was verified (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
       elif [ "$sources" -gt 0 ]; then
-        printf '●  %s process-event source(s) registered, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$sources" "$beacon_desc" "$GRACE"
+        printf '●  %s process-event source(s) registered, but no live watcher or recent wake handoff was verified (last beat: %s, grace %ss).\n' "$sources" "$beacon_desc" "$GRACE"
       else
-        printf '●  X-mode relay polling needs supervision, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$beacon_desc" "$GRACE"
+        printf '●  X-mode relay polling needs supervision, but no live watcher or recent wake handoff was verified (last beat: %s, grace %ss).\n' "$beacon_desc" "$GRACE"
       fi
       if [ "$READ_ONLY" -eq 1 ]; then
         printf '●  This read-only session should report the lapse, not repair it.\n'
