@@ -14,24 +14,46 @@ Python 3 with its standard curses module is required for the terminal viewer.
 
 Each live local Herdr worker pane has its task id followed by a state label.
 `WORKING` and `CI RUNNING` distinguish implementation from checks.
-`NEEDS ANSWER` means a question, review, or approval needs attention.
+`NEEDS ANSWER` is reserved for an actual open worker question.
+`WAITING: <earlier task>` names an unresolved prerequisite rather than claiming the worker is implementing.
+`HOLDING` means a worker is deliberately awaiting your word to continue.
+`REVIEW` asks for PR review when green checks have not been confirmed.
 `READY: merge?` requires reconciled green-check evidence; `READY: apply + merge?` also identifies an unapplied production database change explicitly reported with that evidence.
 An opened PR alone never claims green checks.
 `PAUSED` is a declared external wait, `BLOCKED` needs intervention or a current-state check, and `DONE` is completed work.
-A structured open decision takes precedence over a completion label unless the canonical state owner has already resolved it.
+A reconciled open worker question takes precedence over delivery readiness; a generic backlog approval flag does not hide a green PR.
+Second mate panes use their reconciled child work to distinguish questions, delivery readiness, deliberate holds, and dependencies.
 
 Questions use the `needs-answer` notification class, separately configurable from the `pr-ready` review or merge tag in [notification configuration](configuration.md#producer-tag-notifications-confignotify).
 
 ## Reading the board
 
-Groups are Continuo, Cadenza, ISP, AAA, MCA website, Firstmate, and Other.
-Continuo further groups work into multi-firm programme, gaps and competitor features, compensation, onboarding/legal, and other.
-Each nonempty group shows the relevant sections: Waiting on the captain, Running, Done recently, and Parked with a bring-back trigger.
-Completed backlog entries stay visible for the current UTC date and the preceding two dates.
-Unconfirmed or incomplete worker summaries ask for a state check rather than silently claiming there is no work.
-PR entries include their full HTTPS URL on a separate wrapped line.
+`data/board.md` is the pinned summary; its generated portion stays below 60 lines, independently of inventory size.
+It shows overall counts, up to five groups needing you now, and up to four groups running or waiting on earlier work.
+Long titles and action summaries are shortened, and overflow is counted rather than listed.
+`data/board-full.md`, linked from the summary, contains every projected item with its full title, action, task reference, prerequisite references, and full HTTPS PR URLs.
+Both files use the same canonical snapshot and local group mapping.
+Second mate summaries remain bounded by the snapshot producer; incomplete or omitted records are disclosed rather than described as complete.
 
-The terminal view uses colour for headings, wraps to the pane width, and scrolls with `j`/`k`, arrow keys, Page Up/Page Down, Home, and End.
+`NEEDS YOU NOW` means a current worker question, deliberate wait for your word, PR review or merge request, or a worker failure requiring intervention.
+`QUEUED DECISIONS` counts filed decisions by programme; backlog eligibility alone never means the question has been asked.
+`PARKED` counts deferred work with its bring-back trigger in the full detail file.
+A worker's declared external wait also belongs there.
+Completed entries stay in the full detail file for the current UTC date and preceding two dates; older prerequisites remain as chain context.
+Unconfirmed or incomplete worker summaries request a state check.
+
+Groups are Continuo, Cadenza, ISP, AAA, MCA website, Firstmate, and Other.
+Continuo programme categories are multi-firm programme, gaps and competitor features, compensation, onboarding/legal, and other.
+Dependency groups use existing backlog prerequisite ids within each operational home, never title similarity or a separate relationship store.
+Linked programme records supply programme names; otherwise counts use the project and its configured category.
+Linear sequences show each step's state in prerequisite order and what must happen before the sequence continues.
+Branches name their prerequisites explicitly rather than implying a sequence between siblings.
+Missing prerequisites and dependency cycles remain visible.
+The compact summary shows one PR URL per group and counts any additional PRs in the full detail file.
+
+The terminal view uses a fixed title bar, coloured section headings without Markdown heading markers, spacing, wrapped text, and a visible scrollbar showing position and viewport size.
+Scroll with `j`/`k`, arrow keys, Page Up/Page Down, Home, and End; `f` switches between the summary and full detail, and `q` exits the viewer.
+The footer shows the visible line range and navigation keys.
 It updates the terminal's changed cells rather than clearing and repainting the display.
 The adjacent split stays in firstmate's current tab without taking focus.
 Repeated refreshes reuse the same home-specific pane; closing it allows a subsequent supervision refresh to recreate it.

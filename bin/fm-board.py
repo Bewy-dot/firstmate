@@ -30,8 +30,8 @@ SCRIPT = Path(__file__).resolve().parent
 GROUPS = ['Continuo', 'Cadenza', 'ISP', 'AAA', 'MCA website', 'Firstmate', 'Other']
 CATEGORIES = ['multi-firm programme', 'gaps and competitor features',
               'compensation', 'onboarding/legal', 'other']
-SECTIONS = ['Waiting on the captain', 'Running', 'Done recently',
-            'Parked with a bring-back trigger']
+SECTIONS = ['NEEDS YOU NOW', 'Running', 'Done recently', 'PARKED',
+            'QUEUED DECISIONS']
 NOTES = '## My notes\n'
 
 
@@ -81,36 +81,66 @@ def group_for(record, rules):
     return 'Other', None
 
 
-def task_view(task):
+def short(value, limit=54):
+    value = plain(value)
+    return value if len(value) <= limit else value[:limit - 3].rstrip() + '...'
+
+
+def task_view(task, titles=None):
     current = task.get('current_state', {})
     state, detail = current.get('state', 'unknown'), plain(current.get('detail'))
     backlog = task.get('backlog') or {}
     decisions = task.get('hints', {}).get('open_decisions', [])
     url = (task.get('pr') or {}).get('url') or backlog.get('pr_url')
     if backlog.get('state') == 'done':
-        return 'DONE', 'Done recently', 'Completed'
-    if any(d.get('verb') == 'needs-decision' for d in decisions):
-        return 'NEEDS ANSWER', SECTIONS[0], '; '.join(plain(d['summary']) for d in decisions if d.get('verb') == 'needs-decision')
-    if backlog.get('captain_actionable') or backlog.get('hold_kind') == 'captain':
-        return 'NEEDS ANSWER', SECTIONS[0], plain(backlog.get('hold_reason') or backlog.get('title'))
-    if state == 'paused':
-        return 'PAUSED', SECTIONS[3], detail or 'Waiting for external work; trigger not recorded'
-    if state in ('blocked', 'failed') or any(d.get('verb') == 'blocked' for d in decisions):
+        return 'DONE', SECTIONS[2], 'Completed'
+    questions = [d for d in decisions if d.get('verb') == 'needs-decision']
+    green = state == 'done' and url and re.search(r'checks green|checks.passed|CI checks passed', detail, re.I)
+    merge_word = r"merge (?:word|approval)|(?:approval|permission) to merge|ready (?:to|for) merge|^merge(?: (?:the )?PR\b|\?)"
+    delivery_only = questions and all(re.search(merge_word, plain(d.get('summary')), re.I) for d in questions)
+    if questions and not (green and delivery_only):
+        return 'NEEDS ANSWER', SECTIONS[0], '; '.join(plain(d['summary']) for d in questions)
+    if state == 'failed':
         return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
-    if state == 'parked':
-        return 'NEEDS ANSWER', SECTIONS[0], detail or 'Review and approve the worker’s next step'
     if state == 'done' and url:
-        if re.search(r'checks green|checks.passed|CI checks passed', detail, re.I):
+        if green:
             release_note = detail + ' ' + plain(task.get('paths', {}).get('status_log', {}).get('last_event', {}).get('note'))
             apply = re.search(r'apply.*(?:database|migration)|(?:database|migration).*(?:must|needs?|awaiting|pending|before merge|to be applied)', release_note, re.I) and not re.search(r'already applied|has been applied', release_note, re.I)
             return ('READY: apply + merge?' if apply else 'READY: merge?', SECTIONS[0],
                     'Apply the production database change, then give the merge word' if apply else 'Give the merge word')
-        return 'NEEDS ANSWER', SECTIONS[0], 'Review the PR; green checks have not been confirmed'
+        return 'REVIEW', SECTIONS[0], 'Review the PR; green checks have not been confirmed'
+    blockers = backlog.get('unresolved_blocker_ids') or []
+    if blockers:
+        names = ', '.join((titles or {}).get(key, key) for key in blockers)
+        return 'WAITING: ' + short(names, 48), SECTIONS[1], 'Waiting on ' + names
+    if backlog.get('hold_kind') == 'captain' or state == 'parked':
+        return 'HOLDING', SECTIONS[0], plain(backlog.get('hold_reason')) or detail or 'Awaiting your word to continue'
+    if state == 'paused':
+        return 'PAUSED', SECTIONS[3], detail or 'Waiting for external work; trigger not recorded'
+    if state in ('blocked', 'failed') or any(d.get('verb') == 'blocked' for d in decisions):
+        return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
     if state == 'done':
-        return 'DONE', 'Done recently', detail or 'Completed'
+        return 'DONE', SECTIONS[2], detail or 'Completed'
     if state == 'working':
         return ('CI RUNNING' if re.search(r'\bci (running|pending)\b', detail, re.I) else 'WORKING', SECTIONS[1], detail or 'Worker running')
     return 'BLOCKED', SECTIONS[0], 'Check worker state: ' + (detail or 'current state unavailable')
+
+
+def backlog_view(record):
+    if record.get('state') == 'done':
+        return 'DONE', SECTIONS[2], 'Completed'
+    blockers = record.get('unresolved_blocker_ids') or []
+    reason = plain(record.get('hold_reason') or record.get('blocked_reason') or record.get('reason'))
+    # Eligibility is not evidence that this filed decision has been asked.
+    if record.get('kind') == 'captain' or record.get('hold_kind') == 'captain' or record.get('captain_actionable') or record.get('verb') == 'captain-hold':
+        return 'QUEUED', SECTIONS[4], reason or 'Filed; not yet asked'
+    if blockers:
+        return 'WAITING', SECTIONS[3], 'After ' + ', '.join(blockers)
+    if record.get('current_role') == 'program' or record.get('kind') == 'program':
+        return 'PROGRAMME', SECTIONS[3], reason or 'Continue when its linked work is ready'
+    if record.get('state') == 'in_flight' and record.get('current_role') == 'worker':
+        return 'CHECK', SECTIONS[0], 'Check worker: no current endpoint recorded'
+    return 'PARKED', SECTIONS[3], reason or 'When you choose to start this'
 
 
 def recent(record, now):
@@ -125,111 +155,251 @@ def project(snapshot, rules):
     now = dt.datetime.fromisoformat(snapshot['generated'].replace('Z', '+00:00'))
     rows, labels, seen = [], [], set()
     records = snapshot.get('backlog', {}).get('records', [])
-    tasks = snapshot.get('tasks', [])
-    owners = {row['id']: row for row in snapshot.get('secondmate_current', {}).get('records', [])}
-    # Child state is supplied only by the canonical secondmate roll-up; no home
-    # traversal, remote call, or terminal read is introduced by the board.
-    for task in tasks:
+    titles = {r['id']: plain(r.get('title') or r['id']) for r in records if r.get('id')}
+    owners = {r['id']: r for r in snapshot.get('secondmate_current', {}).get('records', [])}
+    for task in snapshot.get('tasks', []):
         if task.get('kind') == 'secondmate':
-            owner = owners.get(task['id'], {})
-            label = {'active_child_work': 'WORKING', 'captain_decision': 'NEEDS ANSWER',
-                     'externally_held': 'PAUSED', 'no_active_work': 'DONE'}.get(owner.get('current', {}).get('state'), 'BLOCKED')
-            if any(row.get('state') in ('blocked', 'failed') for row in owner.get('endpoints', [])):
-                label = 'BLOCKED'
-            if task.get('backend') == 'herdr' and not task.get('remote') and task.get('endpoint', {}).get('exists') is True:
-                labels.append(dict(id=task['id'], target=task['endpoint']['target'], label=label))
-            continue
+            owners.setdefault(task['id'], dict(id=task['id'], freshness=dict(status='unavailable')))
+
+    def add(record, label, section, action, url=None, scope=''):
+        rows.append(dict(record=record, label=label, section=section, action=action,
+                         url=url or record.get('pr_url'), scope=scope))
+
+    for task in snapshot.get('tasks', []):
+        if task.get('kind') == 'secondmate':
+            continue  # Derive the owner's label from its reconciled children below.
         record = dict(task.get('backlog') or {})
         record.update(id=task['id'], project=task.get('project'))
         record.setdefault('title', task['id'])
-        label, section, action = task_view(task)
+        label, section, action = task_view(task, titles)
         if task.get('backend') == 'herdr' and not task.get('remote') and task.get('endpoint', {}).get('exists') is True:
             labels.append(dict(id=task['id'], target=task['endpoint']['target'], label=label))
-        if section == SECTIONS[2] and not recent(record, now):
-            seen.add(task['id'])
-            continue
-        url = (task.get('pr') or {}).get('url') or record.get('pr_url')
-        rows.append((record, section, action, url))
+        add(record, label, section, action, (task.get('pr') or {}).get('url'))
         seen.add(task['id'])
     for record in records:
-        if not record.get('structured') or record['id'] in seen:
-            continue
-        state = record.get('state')
-        if state == 'done':
-            if not recent(record, now):
-                continue
-            section, action = SECTIONS[2], 'Completed'
-        elif record.get('captain_actionable'):
-            section, action = SECTIONS[0], plain(record.get('hold_reason') or record.get('title'))
-        elif state == 'in_flight' and record.get('current_role') == 'worker':
-            section, action = SECTIONS[0], 'Check worker: no current endpoint recorded'
-        else:
-            section = SECTIONS[3]
-            trigger = record.get('hold_reason') or record.get('blocked_reason')
-            blockers = record.get('unresolved_blocker_ids', [])
-            action = plain(trigger) if trigger else ('After ' + ', '.join(blockers) if blockers else 'When you choose to start this')
-        rows.append((record, section, action, record.get('pr_url')))
+        if record.get('structured') and record['id'] not in seen:
+            add(record, *backlog_view(record))
     for owner in owners.values():
-        recorded = set()
-        for surface, section in [('decisions_open', SECTIONS[0]), ('active_children', SECTIONS[1]), ('holds', SECTIONS[3]), ('queued', SECTIONS[3])]:
+        # Merge overlapping summary surfaces by identity before classifying.
+        children = {}
+        for surface in ('queued', 'holds', 'active_children', 'decisions_open', 'endpoints'):
             for item in owner.get(surface, []):
-                if item['id'] in recorded:
-                    continue
-                recorded.add(item['id'])
-                record = dict(item, id=owner['id'] + '/' + item['id'])
-                selected = SECTIONS[0] if item.get('captain_actionable') else section
-                action = plain(item.get('reason') or item.get('summary') or item.get('doing') or item.get('hold_reason') or item.get('blocked_reason'))
-                if not action:
-                    blockers = item.get('unresolved_blocker_ids', [])
-                    action = 'After ' + ', '.join(blockers) if blockers else 'When you choose to start this'
-                rows.append((record, selected, action, item.get('pr_url')))
-        # The summary already carries current endpoint state. Preserve PR review
-        # and failure actions for terminal children still awaiting delivery.
-        for item in owner.get('endpoints', []):
-            if item['id'] in recorded or item.get('state') not in ('done', 'failed'):
-                continue
-            task = dict(id=item['id'], current_state=dict(state=item['state'], detail=item.get('detail')), pr=dict(url=item.get('pr_url')))
-            _, section, action = task_view(task)
-            if section != SECTIONS[2]:
-                rows.append((dict(item, id=owner['id'] + '/' + item['id']), section, action, item.get('pr_url')))
-        if owner.get('freshness', {}).get('status') not in (None, 'fresh') or owner.get('omitted') or owner.get('provenance', {}).get('summary_valid') is False:
-            rows.append((dict(id=owner['id'], title='Worker status'), SECTIONS[0], 'Check worker: summary incomplete or unavailable', None))
+                child = children.setdefault(item['id'], dict(record={}, decisions=[]))
+                child['record'].update({k: v for k, v in item.items() if v is not None
+                                         and not (surface == 'endpoints' and k == 'state')})
+                if surface == 'decisions_open' and (item.get('source') == 'status' or item.get('verb') in ('needs-decision', 'blocked')):
+                    child['decisions'].append(item)
+                if surface == 'endpoints':
+                    child['endpoint'] = item
+                if surface == 'active_children':
+                    child['active'] = item
+                if surface == 'holds' and item.get('source') == 'child-state':
+                    child['held'] = item
+        owner_labels = []
+        child_titles = {key: plain(c['record'].get('title') or key) for key, c in children.items()}
+        for child in children.values():
+            record = child['record']
+            endpoint = child.get('endpoint')
+            if endpoint or child.get('active') or child.get('held') or child['decisions']:
+                current = endpoint or child.get('active') or child.get('held') or {}
+                state = current.get('state') or ('parked' if child.get('held') else 'working')
+                task = dict(backlog=record, current_state=dict(state=state,
+                            detail=current.get('detail') or current.get('doing') or current.get('reason')),
+                            hints=dict(open_decisions=child['decisions']), pr=dict(url=record.get('pr_url')))
+                label, section, action = task_view(task, child_titles)
+            else:
+                label, section, action = backlog_view(record)
+            owner_labels.append(label)
+            add(record, label, section, action, scope=owner['id'])
+        incomplete = (owner.get('freshness', {}).get('status') not in (None, 'fresh')
+                      or owner.get('omitted') or owner.get('provenance', {}).get('summary_valid') is False
+                      or owner.get('current', {}).get('state') == 'unknown')
+        if incomplete:
+            add(dict(id=owner['id'], title='Worker status'), 'CHECK', SECTIONS[0],
+                'Check worker: summary incomplete or unavailable')
+        # A broad owner state cannot distinguish a question, merge, or designed
+        # hold. Use the same child classifier as the board, including precedence.
+        priority = ('BLOCKED', 'CHECK', 'NEEDS ANSWER', 'READY:', 'REVIEW', 'HOLDING', 'WORKING', 'CI RUNNING', 'WAITING:', 'PAUSED')
+        label = next((value for prefix in priority for value in owner_labels if value.startswith(prefix)), 'DONE')
+        if incomplete or label == 'CHECK':
+            label = 'BLOCKED'
+        for task in snapshot.get('tasks', []):
+            if task['id'] == owner['id'] and task.get('kind') == 'secondmate' and task.get('backend') == 'herdr' and not task.get('remote') and task.get('endpoint', {}).get('exists') is True:
+                labels.append(dict(id=task['id'], target=task['endpoint']['target'], label=label))
     if snapshot.get('secondmate_current', {}).get('registry', {}).get('available') is False:
-        rows.append((dict(id='registered-workers', title='Registered workers'), SECTIONS[0], 'Check worker list: it could not be read', None))
+        add(dict(id='registered-workers', title='Registered workers'), 'CHECK', SECTIONS[0],
+            'Check worker list: it could not be read')
     for record in snapshot.get('secondmate_landed', {}).get('records', []):
         if recent(record, now):
-            rows.append((record, SECTIONS[2], 'Completed', record.get('pr_url')))
-    grouped = {group: {} for group in GROUPS}
-    for record, section, action, url in rows:
-        group, category = group_for(record, rules)
-        title = plain(record.get('title') or record['id'])
-        line = f'- {title} - {plain(action)}'
-        urls = [url] + [link for link in record.get('links', []) if re.search(r'/(?:pull/|-/merge_requests/)\d+', link)]
-        for link in dict.fromkeys(link for link in urls if link and str(link).startswith('https://')):
-            line += '\n  ' + str(link)
-        grouped[group].setdefault((category, section), []).append(line)
-    lines = ['# Crew board', '', 'CLIENT / INITIATIVE REPO', '']
+            add(record, 'DONE', SECTIONS[2], 'Completed', scope=record.get('owner', ''))
+
+    # Keep older completed dependencies as context, without showing all history.
+    referenced = {(r['scope'], key) for r in rows for key in r['record'].get('blocked_by_ids', [])}
+    rows = [r for r in rows if r['section'] != SECTIONS[2] or recent(r['record'], now)
+            or (r['scope'], r['record']['id']) in referenced]
+    unique = {}
+    for row in rows:
+        unique.setdefault((row['scope'], row['record']['id']), row)
+    rows = list(unique.values())
+    for row in rows:
+        if row['section'] == SECTIONS[2] and not recent(row['record'], now):
+            row['section'] = 'Completed prerequisites'
+    for row in rows:
+        row['group'], row['category'] = group_for(row['record'], rules)
+    full = ['# Crew board - full detail', '', '[Compact board](board.md)', '']
     for group in GROUPS:
-        lines += ['## ' + group]
-        content = grouped[group]
-        if not content:
-            lines += ['No current work.', '']
+        selected = [r for r in rows if r['group'] == group]
+        if not selected:
             continue
-        cats = CATEGORIES if group == 'Continuo' else [None]
-        for cat in cats:
-            if cat and not any(key[0] == cat for key in content):
+        full.append('## ' + group)
+        for section in SECTIONS + ['Completed prerequisites']:
+            entries = [r for r in selected if r['section'] == section]
+            if not entries:
                 continue
-            if cat:
-                lines.append('### ' + cat)
-            for section in SECTIONS:
-                entries = content.get((cat, section), [])
-                if entries:
-                    lines += [('#### ' if cat else '### ') + section] + list(dict.fromkeys(entries))
-        lines.append('')
-    # Disclose canonical inventory gaps without claiming an empty, healthy board.
+            full.append('### ' + section)
+            for row in entries:
+                record = row['record']
+                full.append('- ' + plain(record.get('title') or record['id']) +
+                            ' [' + row['label'] + '] - ' + plain(row['action']))
+                if row['category']:
+                    full.append('  Programme: ' + row['category'])
+                full.append('  Task: ' + (row['scope'] + '/' if row['scope'] else '') + record['id'])
+                if record.get('blocked_by_ids'):
+                    full.append('  After: ' + ', '.join(record['blocked_by_ids']))
+                full.extend('  ' + url for url in pr_links(row))
+        full.append('')
+    counts = {section: sum(r['section'] == section for r in rows) for section in SECTIONS}
+    compact = ['# Crew board', '',
+               f"{counts[SECTIONS[0]]} need you | {counts[SECTIONS[1]]} running/waiting | "
+               f"{counts[SECTIONS[4]]} decisions queued | {counts[SECTIONS[3]]} parked",
+               '[Full detail](board-full.md)', '']
+    components = chains(rows)
+    programme_names = {}
+    for component in components:
+        programmes = [short(r['record'].get('title') or r['record']['id'], 45)
+                      for r in component['rows'] if r['record'].get('kind') == 'program']
+        if programmes:
+            for row in component['rows']:
+                programme_names[(row['scope'], row['record']['id'])] = ', '.join(programmes)
+    for section, limit in ((SECTIONS[0], 5), (SECTIONS[1], 4)):
+        compact.append('## ' + section)
+        selected = [c for c in components if c['section'] == section]
+        if not selected:
+            compact.append('See the dependency groups above.' if section == SECTIONS[1] and counts[SECTIONS[1]] else 'None.')
+        for component in selected[:limit]:
+            compact.extend(component_lines(component))
+        if len(selected) > limit:
+            compact.append(f'+{len(selected) - limit} more groups in board-full.md')
+        compact.append('')
+    for section in (SECTIONS[4], SECTIONS[3]):
+        compact.append('## ' + section)
+        selected = [r for r in rows if r['section'] == section]
+        programmes = {}
+        for row in selected:
+            name = programme_names.get((row['scope'], row['record']['id']), row['category'])
+            programme = row['group'] + (' / ' + name if name else '')
+            programmes[programme] = programmes.get(programme, 0) + 1
+        for programme, count in list(programmes.items())[:5]:
+            compact.append(f'- {programme}: {count} ' + ('decisions filed; not yet asked' if section == SECTIONS[4] else 'parked; triggers in full detail'))
+        if len(programmes) > 5:
+            compact.append(f'+{sum(list(programmes.values())[5:])} more in board-full.md')
+        if not selected:
+            compact.append('None.')
+        compact.append('')
+    compact.append(f"Done recently: {counts[SECTIONS[2]]}. Details in board-full.md.")
     if snapshot.get('main_inventory', {}).get('valid') is False:
-        lines += ['Worker records need attention; check the fleet status report.', '']
-    return '\n'.join(lines) + '\n', labels
+        compact.append('Worker records need attention; check the fleet status report.')
+        full.append('Worker records need attention; check the fleet status report.')
+    return '\n'.join(compact) + '\n\n', '\n'.join(full) + '\n', labels
+
+
+def pr_links(row):
+    return list(dict.fromkeys(str(url) for url in
+        [row['url']] + (row['record'].get('links') or [])
+        if url and str(url).startswith('https://') and re.search(r'/(?:pull/|-/merge_requests/)\d+', str(url))))
+
+
+def chains(rows):
+    """Connected dependencies, ordered prerequisites first, scoped to one home.
+
+    Project/category supplies programme context; only canonical blocker ids add
+    edges. Missing prerequisites stay explicit in the waiting reason.
+    """
+    by_id = {(r['scope'], r['record']['id']): r for r in rows}
+    edges = {key: set() for key in by_id}
+    for key, row in by_id.items():
+        for dep in row['record'].get('blocked_by_ids') or []:
+            other = (row['scope'], dep)
+            if other in edges:
+                edges[key].add(other)
+                edges[other].add(key)
+    result, seen = [], set()
+    for key in by_id:
+        if key in seen:
+            continue
+        pending, keys = [key], []
+        while pending:
+            node = pending.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            keys.append(node)
+            pending.extend(sorted(edges[node] - seen, reverse=True))
+        ordered, remaining, cycle = [], set(keys), False
+        while remaining:
+            ready = [k for k in keys if k in remaining and not any(
+                (by_id[k]['scope'], dep) in remaining for dep in by_id[k]['record'].get('blocked_by_ids') or [])]
+            if not ready:  # Cycles must remain visible, never hang the renderer.
+                cycle = True
+                ordered.extend(by_id[k] for k in keys if k in remaining)
+                break
+            for node in ready:
+                remaining.remove(node)
+                ordered.append(by_id[node])
+        section = next((section for section in (SECTIONS[0], SECTIONS[1], SECTIONS[4], SECTIONS[3], SECTIONS[2])
+                        if any(r['section'] == section for r in ordered)), SECTIONS[3])
+        result.append(dict(rows=ordered, section=section, cycle=cycle))
+    return result
+
+
+def component_lines(component):
+    all_rows = component['rows']
+    rows = [r for r in all_rows if r['section'] != SECTIONS[4]]
+    queued = len(all_rows) - len(rows)
+    group = rows[0]['group']
+
+    def link(row):
+        return short(row['record'].get('title') or row['record']['id'], 30) + ' [' + (
+            row['label'] if not row['label'].startswith('WAITING:') else 'WAITING') + ']'
+
+    linear = not component['cycle'] and all(
+        before['record']['id'] in (after['record'].get('blocked_by_ids') or [])
+        for before, after in zip(rows, rows[1:]))
+    if linear:
+        links = [link(row) for row in rows[:4]]
+        separator = ' -> '
+    else:
+        names = {row['record']['id']: short(row['record'].get('title') or row['record']['id'], 24) for row in rows}
+        links = []
+        for row in rows[:4]:
+            deps = row['record'].get('blocked_by_ids') or []
+            links.append(link(row) + (' after ' + ', '.join(names.get(dep, short(dep, 24)) for dep in deps) if deps else ''))
+        separator = '; '
+    if len(rows) > 4:
+        links.append('+' + str(len(rows) - 4) + ' steps in full detail')
+    waits = [r for r in rows if r['section'] == SECTIONS[0]] or [r for r in rows if r['label'].startswith('WAITING')]
+    action = '; '.join(dict.fromkeys(plain(r['action']) for r in waits)) or plain(rows[0]['action'])
+    if component['cycle']:
+        action = 'Check dependency cycle before continuing'
+    elif len(rows) > 1:
+        action = short(action, 75) + '; then continue in dependency order'
+    lines = ['- ' + group + ': ' + separator.join(links) +
+             (f' (+{queued} queued decisions)' if queued else ''), '  ' + short(action, 115)]
+    urls = list(dict.fromkeys(url for row in all_rows for url in pr_links(row)))
+    lines.extend('  ' + url for url in urls[:1])
+    if len(urls) > 1:
+        lines[-1] += f' (+{len(urls) - 1} PRs in board-full.md)'
+    return lines
 
 
 def write_board(path, generated):
@@ -340,7 +510,8 @@ def refresh(args, home):
         snapshot = json.loads(Path(args.snapshot).read_text()) if args.snapshot else json.loads(subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--json'], text=True, timeout=180))
         if snapshot.get('schema') != 'fm-fleet-snapshot.v1':
             raise ValueError('expected fm-fleet-snapshot.v1')
-        generated, labels = project(snapshot, rules)
+        generated, full, labels = project(snapshot, rules)
+        write_board(home / 'data/board-full.md', full)
         write_board(home / 'data/board.md', generated)
         if args.command == 'refresh':
             update_panes(home, labels)
@@ -349,48 +520,72 @@ def refresh(args, home):
 
 def view(home):
     def display(screen):
+        curses.curs_set(0)
         curses.use_default_colors()
         for index, color in enumerate((curses.COLOR_CYAN, curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_MAGENTA), 1):
             curses.init_pair(index, color, -1)
         screen.timeout(1000)
-        offset, refreshed = 0, 0
+        offset, refreshed, detailed = 0, 0, False
         process = None
+
+        def draw(y, x, text, width, style=0):
+            try:
+                screen.addnstr(y, x, text, max(0, width), style)
+            except curses.error:
+                pass
+
         while True:
             if time.monotonic() - refreshed > 5 and (process is None or process.poll() is not None):
                 process = subprocess.Popen([str(SCRIPT / 'fm-board.sh'), 'refresh'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 refreshed = time.monotonic()
             height, width = screen.getmaxyx()
-            path = home / 'data/board.md'
+            path = home / ('data/board-full.md' if detailed else 'data/board.md')
             text = path.read_text() if path.exists() else 'Waiting for board...'
             lines = []
             for line in text.splitlines():
-                color = (2 if 'Waiting on the captain' in line else 3 if 'Done recently' in line else 4 if 'Parked with' in line else 1 if line.startswith('#') else 0)
-                for wrapped in textwrap.wrap(line, max(1, width - 2), replace_whitespace=False) or ['']:
-                    lines.append((wrapped, color))
-            offset = max(0, min(offset, max(0, len(lines) - height + 1)))
+                if line.startswith('# Crew board'):
+                    continue
+                heading = line.startswith('#')
+                color = (2 if 'NEEDS YOU NOW' in line else 3 if 'Done recently' in line else 4 if 'PARKED' in line or 'QUEUED DECISIONS' in line else 1 if heading else 0)
+                line = line.lstrip('#').strip() if heading else line
+                line = line.replace('[Full detail](board-full.md)', 'Full detail: data/board-full.md')
+                line = line.replace('[Compact board](board.md)', 'Compact board: data/board.md')
+                if line.startswith('- '):
+                    line = '  ' + line[2:]
+                for wrapped in textwrap.wrap(line, max(1, width - 6), replace_whitespace=False) or ['']:
+                    lines.append((wrapped, curses.color_pair(color) | (curses.A_BOLD if heading else 0)))
+            viewport = max(1, height - 4)
+            offset = max(0, min(offset, max(0, len(lines) - viewport)))
             screen.erase()
-            for row, (line, color) in enumerate(lines[offset:offset + height - 1]):
-                try:
-                    screen.addnstr(row, 0, line, max(0, width - 1), curses.color_pair(color))
-                except curses.error:
-                    pass
-            try:
-                screen.addnstr(height - 1, 0, 'j/k scroll | PgUp/PgDn | q exit', max(0, width - 1), curses.A_DIM)
-            except curses.error:
-                pass
+            draw(0, 1, 'CREW BOARD  /  ' + ('Full detail' if detailed else 'At a glance'), width - 3,
+                 curses.color_pair(1) | curses.A_BOLD)
+            draw(1, 1, '─' * max(0, width - 3), width - 3, curses.A_DIM)
+            for row, (line, style) in enumerate(lines[offset:offset + viewport]):
+                draw(row + 2, 1, line, width - 4, style)
+            # An always-visible track shows both position and viewport size.
+            thumb = max(1, min(viewport, viewport * viewport // max(1, len(lines))))
+            start = (viewport - thumb) * offset // max(1, len(lines) - viewport)
+            for row in range(viewport):
+                draw(row + 2, width - 2, '█' if start <= row < start + thumb else '│', 1,
+                     curses.color_pair(1) if start <= row < start + thumb else curses.A_DIM)
+            progress = f'{offset + 1}-{min(offset + viewport, len(lines))}/{len(lines)}'
+            draw(height - 1, 1, 'j/k scroll  PgUp/Dn  f summary/detail  q exit  ' + progress,
+                 width - 3, curses.A_DIM)
             screen.noutrefresh()
             curses.doupdate()
             key = screen.getch()
             if key == ord('q'):
                 return
-            if key in (ord('j'), curses.KEY_DOWN):
+            if key == ord('f'):
+                detailed, offset = not detailed, 0
+            elif key in (ord('j'), curses.KEY_DOWN):
                 offset += 1
             elif key in (ord('k'), curses.KEY_UP):
                 offset -= 1
             elif key == curses.KEY_NPAGE:
-                offset += max(1, height - 2)
+                offset += viewport
             elif key == curses.KEY_PPAGE:
-                offset -= max(1, height - 2)
+                offset -= viewport
             elif key == curses.KEY_HOME:
                 offset = 0
             elif key == curses.KEY_END:
