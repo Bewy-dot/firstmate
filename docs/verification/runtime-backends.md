@@ -202,7 +202,7 @@ No ambient `herdr server stop` command is a supported test operation.
 
 ### Crew board and pane labels
 
-Verified on 2026-10-29 with Herdr 0.9.5 protocol 22 on macOS through the guarded named-session lab.
+Verified on 2026-10-30 with Herdr 0.9.5 protocol 22 on macOS through the guarded named-session lab.
 
 ```sh
 FM_TEST_HERDR_BOARD=1 bash tests/fm-board-herdr-e2e.test.sh
@@ -216,6 +216,8 @@ ok - real Herdr: labels, rendered board, adjacent placement, reuse, and closed-p
 ```
 
 The test includes a PATH longer than the canonical terminal input limit, checks mode 0700 on the generated viewer script, and waits for a real shell prompt before launch.
+The worker and second mate pane cases include waiting on an earlier task, a green PR with a generic approval flag, and a deliberate captain hold reported as blocked.
+`bash tests/fm-board.test.sh` additionally exercises the compact/full files, dependency grouping, filed decisions, note preservation, and the terminal scrollbar and detail toggle through a real pseudo-terminal.
 Its teardown verifies that the live default session is unchanged.
 This test covers presentation and shell startup, independently of worker harness choice; canonical fleet state remains owned by `bin/fm-fleet-snapshot.sh`.
 

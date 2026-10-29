@@ -10,7 +10,7 @@ command -v herdr >/dev/null || { echo 'skip: herdr not installed'; exit 0; }
 original_path=$PATH
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-board-e2e.XXXXXX")
 HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
-HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-board-and-labels)
+HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-board-v2)
 cleanup() {
   local rc=$?
   trap - EXIT
@@ -79,7 +79,7 @@ board=$(lab pane list --workspace "$workspace" | jq -r '.result.panes[] | select
 # Verify the process actually renders the file, rather than merely existing.
 rendered=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if lab pane read "$board" --source recent --lines 80 | grep -q 'Crew board'; then rendered=1; break; fi
+  if lab pane read "$board" --source recent --lines 80 | grep -q 'CREW BOARD'; then rendered=1; break; fi
   sleep 0.2
 done
 [ "$rendered" = 1 ] || fail 'board viewer did not render'
@@ -93,13 +93,21 @@ root, tmp, pane, session = sys.argv[1:]
 p = pathlib.Path(tmp) / 'fixture.json'
 s = json.loads(p.read_text())
 t = s['tasks'][0]
-for state, detail, expected in [
-    ('working', 'Implementing', 'WORKING'), ('working', 'ci running', 'CI RUNNING'),
-    ('done', 'checks green', 'READY: merge?'),
-    ('done', 'checks green; apply production database migration before merge', 'READY: apply + merge?'),
-    ('paused', 'Resume after upstream release', 'PAUSED'), ('blocked', 'Need credentials', 'BLOCKED'),
-    ('done', 'Report completed', 'DONE')]:
-    t['hints'] = {}
+for state, detail, expected, backlog in [
+    ('working', 'Implementing', 'WORKING', {}), ('working', 'ci running', 'CI RUNNING', {}),
+    ('working', 'Implementing', 'WAITING: Earlier step',
+     dict(unresolved_blocker_ids=['earlier'])),
+    ('done', 'checks green', 'READY: merge?',
+     dict(captain_actionable=True, hold_kind='captain', hold_reason='Merge this')),
+    ('done', 'checks green; apply production database migration before merge', 'READY: apply + merge?', {}),
+    ('blocked', 'Waiting for captain word', 'HOLDING',
+     dict(hold_kind='captain', hold_reason='Wait for the captain word')),
+    ('paused', 'Resume after upstream release', 'PAUSED', {}),
+    ('blocked', 'Need credentials', 'BLOCKED', {}),
+    ('done', 'Report completed', 'DONE', {})]:
+    t['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Awaiting your merge word')]) if expected == 'READY: merge?' else {}
+    t['backlog'] = dict(id=t['id'], title='Test work', repo='continuo', **backlog)
+    s['backlog']['records'] = [dict(id='earlier', title='Earlier step', structured=True, repo='continuo', state='in_flight')]
     t['current_state'] = dict(state=state, detail=detail)
     t['pr'] = {} if expected == 'DONE' else dict(url='https://github.com/example/continuo/pull/1')
     p.write_text(json.dumps(s))
@@ -107,6 +115,25 @@ for state, detail, expected in [
     info = json.loads(subprocess.check_output(['herdr', 'pane', 'get', pane, '--session', session]))
     actual = info['result']['pane']['label']
     assert actual == t['id'] + ' - ' + expected, (actual, expected)
+# Exercise the same three reported misreads on a second mate's aggregate pane.
+s['tasks'] = [dict(id='mate', kind='secondmate', backend='herdr',
+                   endpoint=dict(target=session + ':' + pane, exists=True))]
+for state, detail, backlog, expected in [
+    ('working', 'Implementing', dict(unresolved_blocker_ids=['earlier']), 'WAITING: Earlier step'),
+    ('done', 'checks green', dict(hold_kind='captain', captain_actionable=True), 'READY: merge?'),
+    ('blocked', 'Wait for captain word', dict(hold_kind='captain', hold_reason='Wait for captain word'), 'HOLDING')]:
+    s['secondmate_current'] = dict(records=[dict(id='mate',
+        current=dict(state='active_child_work' if state == 'working' else 'captain_decision'),
+        freshness=dict(status='fresh'), provenance=dict(summary_valid=True),
+        queued=[dict(id='child', repo='continuo', title='Next step', **backlog),
+                dict(id='earlier', repo='continuo', title='Earlier step')],
+        endpoints=[dict(id='child', state=state, detail=detail,
+                        pr_url='https://github.com/example/continuo/pull/1')])])
+    p.write_text(json.dumps(s))
+    subprocess.run([root+'/bin/fm-board.sh', 'refresh', '--snapshot', str(p)], check=True)
+    info = json.loads(subprocess.check_output(['herdr', 'pane', 'get', pane, '--session', session]))
+    assert info['result']['pane']['label'] == 'mate - ' + expected, info
+
 PY
 export PATH="$original_path"
 pass 'real Herdr: labels, rendered board, adjacent placement, reuse, and closed-pane recovery'

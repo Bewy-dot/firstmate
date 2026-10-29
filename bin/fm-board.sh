@@ -5,7 +5,7 @@
 # watcher. It no-ops outside Herdr, requires the adapter's verified launcher
 # identity, and never starts a server or closes a pane. view renders board.md
 # with scrolling and refreshes it even between supervision cycles.
-# render writes data/board.md on any backend; --snapshot imports a previously
+# render writes data/board.md and data/board-full.md on any backend; --snapshot imports a previously
 # captured fm-fleet-snapshot.v1 object for offline previews and fixture tests.
 # Data model, config, and rendering are owned by fm-board.py; fleet semantics
 # remain owned by fm-fleet-snapshot.sh and fm-crew-state.sh.
