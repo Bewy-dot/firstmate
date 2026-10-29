@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # fm-notify.sh - the single owner of firstmate's captain-audible producer tags.
 #
-# Three supervision events earn a distinct desktop notification, so a sound the
+# Four supervision events earn a distinct desktop notification, so a sound the
 # captain hears always carries signal. Everything else - ordinary turn-ends,
 # watcher polls, routine progress - stays silent by design.
 #
 #   pr-merged   a task's pull request landed
 #   pr-ready    a task's pull request is open and ready for the captain's review
-#   attention   a task finished, failed, needs a decision, or is blocked
+#   needs-answer an open question for the captain
+#   attention   a task finished, failed, or is blocked
 #
 # Usage:
 #   fm-notify.sh [--once <key>] <event-class> <title> [body]
@@ -23,7 +24,8 @@
 # --from-status maps one captain-relevant status event onto a class, so the
 # status vocabulary has exactly one notification owner:
 #   done: with a PR/MR URL (or a "PR ..." note) -> pr-ready
-#   done: / failed: / needs-decision: / blocked: -> attention
+#   needs-decision: -> needs-answer
+#   done: / failed: / blocked: -> attention
 #   anything else -> silent
 #
 # Manual smoke - run each to hear its spoken tag:
@@ -43,7 +45,7 @@
 # captain's desktop and only the primary home's supervision paths ever beep.
 #
 # Config: config/notify (local, gitignored), one `key=value` per non-empty,
-# non-comment line, last assignment wins. An absent file means the three
+# non-comment line, last assignment wins. An absent file means the four
 # classes below speak their default phrase in the default voice.
 #
 #   enabled=off                     global kill switch (on|off, default on)
@@ -53,12 +55,15 @@
 #   speech-tail-ms=<ms>             silence spoken after every phrase (default 1500)
 #   pr-merged=<sound>[,<channel>]   per-class overrides; the bare value `off`
 #   pr-ready=<sound>[,<channel>]    disables that one class. A leading comma
+#   needs-answer=<sound>[,<channel>]
 #   attention=<sound>[,<channel>]   (`,herdr`) keeps the default sound or phrase.
 #   pr-merged=speak[,<channel>]     the literal value `speak` switches that class
 #   pr-ready=speak[,<channel>]      from a named sound to a spoken phrase - this
+#   needs-answer=speak[,<channel>]
 #   attention=speak[,<channel>]     is also the default when the class is unset.
 #   pr-merged-phrase=<text>         the words spoken for that class, without lead
 #   pr-ready-phrase=<text>          or trailing silence (speech-lead-ms/tail-ms add
+#   needs-answer-phrase=<text>
 #   attention-phrase=<text>         it); unset means the default phrase below.
 #
 # Channels: auto (default), macos, herdr, both, none. FM_NOTIFY_CHANNEL
@@ -66,7 +71,7 @@
 #   auto resolves to macos when osascript is available, else herdr when the
 #   herdr CLI is available, else nothing. macOS Notification Center is
 #   preferred even inside herdr because a spoken phrase or a named system sound
-#   is what makes the three classes audibly distinct; herdr offers only
+#   is what makes the four classes audibly distinct; herdr offers only
 #   none|done|request. Set `channel=both` for the herdr toast alongside the
 #   macOS tag, or `channel=herdr` to keep every tag inside the herdr UI.
 #
@@ -78,6 +83,7 @@
 #   class      macOS default sound   herdr sound
 #   pr-merged  Glass                 done
 #   pr-ready   Ping                  done
+#   needs-answer Hero                request
 #   attention  Sosumi                request
 #
 # Speech. When a class resolves to speak mode (the default, or an explicit
@@ -160,7 +166,7 @@ notify_trim() {  # <text>
 
 notify_class_valid() {  # <class>
   case "$1" in
-    pr-merged|pr-ready|attention) return 0 ;;
+    pr-merged|pr-ready|needs-answer|attention) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -169,6 +175,7 @@ notify_default_sound() {  # <class>
   case "$1" in
     pr-merged) printf 'Glass' ;;
     pr-ready) printf 'Ping' ;;
+    needs-answer) printf 'Hero' ;;
     attention) printf 'Sosumi' ;;
   esac
 }
@@ -183,7 +190,8 @@ notify_default_sound() {  # <class>
 notify_default_phrase() {  # <class>
   case "$1" in
     pr-merged) printf '%s' '[[rate 170]] [[emph +]]Another[[emph -]] one down!' ;;
-    pr-ready) printf '%s' 'Ready for review' ;;
+    pr-ready) printf '%s' 'Ready for review or merge' ;;
+    needs-answer) printf '%s' 'Your answer is needed' ;;
     attention) printf '%s' 'Hey - [[slnc 200]] take a look' ;;
   esac
 }
@@ -230,7 +238,7 @@ notify_speech_wrap() {  # <phrase>
 # rather than configurable: there is nothing to tune between three values.
 notify_herdr_sound() {  # <class>
   case "$1" in
-    attention) printf 'request' ;;
+    attention|needs-answer) printf 'request' ;;
     *) printf 'done' ;;
   esac
 }
@@ -629,7 +637,7 @@ notify_from_status() {  # <task-id> <status-line>
       fi
       ;;
     failed) class=attention; title='firstmate: task failed' ;;
-    needs-decision) class=attention; title='firstmate: decision needed' ;;
+    needs-decision) class=needs-answer; title='firstmate: decision needed' ;;
     blocked) class=attention; title='firstmate: blocked' ;;
     *) return 0 ;;
   esac

@@ -118,7 +118,7 @@ See [`wedge-alarm.md`](wedge-alarm.md) for the current channel reference, [`veri
 
 ## Producer-tag notifications (config/notify)
 
-Three supervision events earn a distinct desktop notification, so a sound the captain hears always carries signal: `pr-merged` when a task's pull request lands, `pr-ready` when a task's pull request is open and waiting on the captain's review, and `attention` when a task finishes, fails, needs a decision, or is blocked.
+Four supervision events earn distinct desktop notifications: `pr-merged` for a landed PR, `pr-ready` for a PR awaiting review or merge, `needs-answer` for a question requiring the captain, and `attention` for a finished, failed, or blocked task.
 Ordinary turn-ends, watcher polls, and routine progress stay silent.
 `bin/fm-notify.sh` owns the whole feature - the event classes, the status-to-class mapping, channel and sound resolution, the once-per-fact dedup, and the config below - and its header owns the exact mechanics and the manual smoke commands.
 
@@ -126,7 +126,7 @@ The tag fires only from a genuine primary firstmate home whose state directory i
 Notification is always best-effort: the script exits 0 whatever happens, because the underlying event is already recorded durably and a missing binary or refused channel must never break a merge or a supervision cycle.
 
 `config/notify` (local, gitignored) holds one `key=value` per non-empty, non-comment line, last assignment wins.
-An absent file means all three classes are on and speak their default phrase in the default voice - a spoken word carries across a room in a way a system bleep does not.
+An absent file means all four classes are on and speak their default phrase in the default voice - a spoken word carries across a room in a way a system bleep does not.
 
 ```
 enabled=off                     # global kill switch (on|off, default on)
@@ -136,20 +136,22 @@ speech-lead-ms=<ms>             # silence spoken before every phrase (default 70
 speech-tail-ms=<ms>             # silence spoken after every phrase (default 1500)
 pr-merged=<sound>[,<channel>]   # per-class sound and optional channel override,
 pr-ready=<sound>[,<channel>]    # or the bare value `off` to silence that class,
+needs-answer=<sound>[,<channel>]
 attention=<sound>[,<channel>]   # or the bare value `speak` to switch that class
                                  # from a named sound to a spoken phrase (the
                                  # default when the class is unset)
 pr-merged-phrase=<text>         # the words spoken for that class, with no lead
 pr-ready-phrase=<text>          # or trailing silence of their own (speech-lead-ms
+needs-answer-phrase=<text>
 attention-phrase=<text>         # / speech-tail-ms add that); unset means the
                                  # captain-chosen default phrase
 ```
 
 Channels are `auto` (default), `macos`, `herdr`, `both`, and `none`, and `FM_NOTIFY_CHANNEL` overrides every configured channel with one directive.
 `auto` resolves to the macOS Notification Center when `osascript` is available, else a herdr UI notification when the herdr CLI is available, else nothing.
-macOS wins even inside herdr because a spoken phrase or a named system sound is what makes the three classes audibly distinct, while `herdr notification show` offers only `none`, `done`, and `request`; set `channel=both` for the herdr toast alongside the macOS tag.
-Sounds are named macOS system sounds and default to `Glass` for `pr-merged`, `Ping` for `pr-ready`, and `Sosumi` for `attention`; a value that is not a plain sound name is refused and the default is used.
-Herdr sounds are fixed per class (`done`, `done`, `request`) because the CLI accepts only three values, and herdr never speaks.
+macOS wins even inside herdr because a spoken phrase or a named system sound is what makes the four classes audibly distinct, while `herdr notification show` offers only `none`, `done`, and `request`; set `channel=both` for the herdr toast alongside the macOS tag.
+Sounds are named macOS system sounds and default to `Glass` for `pr-merged`, `Ping` for `pr-ready`, `Hero` for `needs-answer`, and `Sosumi` for `attention`; a value that is not a plain sound name is refused and the default is used.
+Herdr sounds are fixed per class (`done` for PR events, `request` for questions and attention) because the CLI accepts only three values, and herdr never speaks.
 
 By default (or with the explicit value `speak`), the macOS leg speaks a phrase instead of playing a named sound; a class explicitly configured with a sound name keeps that pre-speech behavior unchanged.
 Every spoken phrase - the captain-chosen default or a configured `<class>-phrase` - is wrapped with `speech-lead-ms` of silence before it and `speech-tail-ms` after, as macOS speech commands (`[[slnc <ms>]]`), because the audio device is still waking on the first syllable and needs real runway to drain at the end.
@@ -647,3 +649,7 @@ Only after those retries exhaust does it remove the lock, and only when it is pr
 A live lock, a missing `lsof`, any failed check, or any other fetch failure keeps today's behavior.
 Every wait, retry, and removal is printed to stderr, and a successful recovery also prints one `recovered:` summary line to stdout so a session-start refresh - which discards fleet-sync stderr and relays only stdout - still surfaces it.
 The shared staleness proof lives in `bin/fm-lock-lib.sh`, which both `fm-teardown.sh` and `fm-fleet-sync.sh` use.
+
+## Living crew board
+
+See [Crew board and pane labels](crew-board.md) for the pinned Herdr pane, preserved notes, and local group mapping.

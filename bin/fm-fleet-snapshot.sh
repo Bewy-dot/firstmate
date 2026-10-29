@@ -47,6 +47,8 @@
 #     Each structured-home record carries active_children, decisions_open, holds,
 #     queued, landed, endpoints, counts, and omitted. Actionable captain holds
 #     appear in decisions_open; blocked captain holds remain queued with metadata.
+#     Summary rows retain repo/title/PR URL for presentation; endpoints also retain
+#     current-state detail so terminal children awaiting PR delivery stay visible.
 #   secondmate_landed: {records[],truncated[],unreadable[],partial[]} - the
 #     compatibility landed-work roll-up derived from secondmate_current. Readable
 #     structured homes with an unknown current classification are partial, not
@@ -662,7 +664,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
          | {id:(.id | trunc(120)),title:(.title | trunc(120)),
             pr_url:((.pr_url // null) | if . == null then null else trunc(500) end),
             report_path:((.report_path // null) | if . == null then null else trunc(500) end),
-            local_note:((.local_note // null) | if . == null then null else trunc(120) end),completion} ]
+            local_note:((.local_note // null) | if . == null then null else trunc(120) end),repo,completion} ]
        | sort_by([(.completion.date // ""), .id]) | reverse) as $landed_all
     | ([ $tasks[] | select(.current_state.state == "unknown") ]) as $unknown_children
     | ([ $owned_in_flight[]
@@ -758,7 +760,11 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
           repo:((.repo // null) | if . == null then null else trunc(120) end),
           kind:((.kind // null) | if . == null then null else trunc(40) end)}][:$queued_n]),
         landed:(if $landed_n == 0 then $landed_all else $landed_all[:$landed_n] end),
-        endpoints:([$tasks[] | {id,state:.current_state.state,source:.current_state.source,
+        endpoints:([$tasks[] | . as $task
+          | ([$backlog.records[]? | select(.id == $task.id)][0] // {}) as $row
+          | {id,state:.current_state.state,source:.current_state.source,
+          detail:.current_state.detail,title:($row.title // .id),
+          repo:($row.repo // .project),pr_url:(.pr.url // $row.pr_url),
           endpoint:(.endpoint + {target:((.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
         counts:{
           active_children:($active_all | length),
@@ -775,7 +781,15 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
           (if ($tasks | length) > $child_n then {surface:"endpoints",count:(($tasks | length) - $child_n)} else empty end),
           (if $landed_n > 0 and ($landed_all | length) > $landed_n then {surface:"landed",count:(($landed_all | length) - $landed_n)} else empty end)
         ]
-      }'
+      }
+    | . as $summary
+    | reduce ["active_children","decisions_open","holds","queued"][] as $surface ($summary;
+        .[$surface] |= map(. as $item
+          | ([$backlog.records[]? | select(.id == $item.id)][0] // {}) as $row
+          | ([$tasks[]? | select(.id == $item.id)][0] // {}) as $task
+          | . + {repo:($row.repo // $task.project // null),
+                 title:($row.title // .title // .id),
+                 pr_url:($task.pr.url // $row.pr_url // null)}))'
 }
 
 # Current registered-secondmate aggregation.

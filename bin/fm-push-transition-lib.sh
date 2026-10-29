@@ -135,6 +135,7 @@ mark_surfaced() {  # <status-file>
   printf '%s' "$last" > "$marker"
   [ "$previous" = "$last" ] && return 0
   notify_status_surfaced "$task" "$last"
+  FM_HOME="$FM_HOME" "$FM_PUSH_TRANSITION_LIB_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
 }
 
 # Act on a fresh actionable transition from a push-capable backend.
