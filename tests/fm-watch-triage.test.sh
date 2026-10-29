@@ -350,6 +350,13 @@ test_provably_working_signal_absorbed() {
   fi
   [ ! -s "$out" ] || fail "provably-working signal printed a wake reason: $(cat "$out")"
   [ ! -s "$state/.wake-queue" ] || fail "provably-working signal enqueued a durable wake record"
+  # Wait for processing, independently of the liveness window: startup and
+  # signal coalescing can exceed three seconds on a loaded test host.
+  for _ in {1..100}; do
+    [ ! -s "$state/.seen-task_status" ] || break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
   [ -s "$state/.seen-task_status" ] || fail "provably-working signal did not advance its .seen-* suppressor"
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"

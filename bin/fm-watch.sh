@@ -768,6 +768,9 @@ if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; the
 fi
 
 while :; do
+  # Presentation is independent of wake delivery. Its non-blocking lock and
+  # content fingerprint collapse retries, and non-Herdr backends no-op.
+  FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
   # Self-eviction: if the singleton lock no longer names this process, a second
   # watcher has taken over (e.g. a transient duplicate from a racy arm). Stand
   # down so the rightful singleton continues alone. The EXIT trap's release

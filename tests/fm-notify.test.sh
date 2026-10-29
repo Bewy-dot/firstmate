@@ -55,6 +55,7 @@ CONFIG="$PRIMARY/config/notify"
 cat > "$CONFIG" <<'EOF'
 pr-merged=Glass
 pr-ready=Ping
+needs-answer=Hero
 attention=Sosumi
 EOF
 
@@ -126,10 +127,10 @@ notify --from-status alpha "needs-decision [key=api]: two shapes are viable"
 notify --from-status alpha "blocked: no credential for the forge"
 OUT=$(logged)
 assert_contains "$OUT" "firstmate: task failed alpha: the build never recovered" "failed: must raise the attention tag"
-assert_contains "$OUT" "firstmate: decision needed alpha: two shapes are viable" "needs-decision: must raise the attention tag"
+assert_contains "$OUT" "firstmate: decision needed alpha: two shapes are viable" "needs-decision: must raise the needs-answer tag"
 assert_contains "$OUT" "firstmate: blocked alpha: no credential for the forge" "blocked: must raise the attention tag"
-[ "$(logged | awk '{print $2}' | sort -u)" = Sosumi ] || fail "every terminal/needs-input verb must share one sound"
-pass "done, failed, needs-decision, and blocked all raise the single attention tag"
+assert_contains "$OUT" "macos Hero firstmate: decision needed" "needs-answer must sound different from PR-ready and attention"
+pass "decisions have their own tag; finished, failed, and blocked use attention"
 
 reset_log
 notify --from-status alpha "working: rebased onto merged #76"
@@ -351,17 +352,19 @@ reset_log
 notify pr-merged "t" "b"
 notify pr-ready "t" "b"
 notify attention "t" "b"
+notify needs-answer "t" "b"
 OUT=$(logged)
 assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] [[rate 170]] [[emph +]]Another[[emph -]] one down! [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
   "pr-merged must default to speaking the captain's chosen phrase, padded with the default lead-in and trailing silence"
-assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Ready for review [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
+assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Ready for review or merge [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
   "pr-ready must default to speaking the captain's chosen phrase, padded with the default lead-in and trailing silence"
 assert_contains "$OUT" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc $NOTIFY_TEST_DEFAULT_LEAD_MS]] Hey - [[slnc 200]] take a look [[slnc $NOTIFY_TEST_DEFAULT_TAIL_MS]]" \
   "attention must default to speaking the captain's chosen phrase, padded with the default lead-in and trailing silence"
+assert_contains "$OUT" "Your answer is needed" "needs-answer must speak distinctly from review or merge"
 LINES=$(logged | wc -l | tr -d '[:space:]')
-[ "$LINES" = 3 ] || fail "expected exactly 3 speech calls, got $LINES: $OUT"
+[ "$LINES" = 4 ] || fail "expected exactly 4 speech calls, got $LINES: $OUT"
 DISTINCT=$(logged | sort -u | wc -l | tr -d '[:space:]')
-[ "$DISTINCT" = 3 ] || fail "the three default phrases must be audibly distinct from one another: $OUT"
+[ "$DISTINCT" = 4 ] || fail "the four default phrases must be audibly distinct from one another: $OUT"
 pass "an unconfigured class defaults to speaking its own distinct captain-chosen phrase in the default voice"
 
 reset_log
@@ -387,7 +390,7 @@ pass "config/notify overrides the speech voice for every class via voice="
 reset_log
 printf 'speech-lead-ms=100\nspeech-tail-ms=3000\n' > "$CONFIG"
 notify pr-ready "t" "b"
-assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc 100]] Ready for review [[slnc 3000]]" \
+assert_contains "$(logged)" "speak:$NOTIFY_TEST_DEFAULT_VOICE:[[slnc 100]] Ready for review or merge [[slnc 3000]]" \
   "configured speech-lead-ms/speech-tail-ms must replace the default padding"
 pass "config/notify overrides the lead-in and trailing silence via speech-lead-ms/speech-tail-ms"
 

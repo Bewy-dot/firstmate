@@ -166,7 +166,7 @@ Claude, Codex, OpenCode, Pi, pi-signed, Grok, and Kimi share that backend cleanu
 ## Herdr
 
 The compatibility floor is protocol 14.
-The latest active verification uses Herdr 0.7.5 protocol 17 on macOS aarch64, with earlier 0.7.5 protocol-16, 0.7.4, protocol-14, and 0.7.3 evidence retained where they define current behavior or fallbacks.
+Core adapter verification uses Herdr 0.7.5 protocol 17 on macOS aarch64, with earlier 0.7.5 protocol-16, 0.7.4, protocol-14, and 0.7.3 evidence retained where they define current behavior or fallbacks.
 Protocol 17 keeps every protocol-16 feature gate satisfied; the event and workspace-move floors remain 16.
 
 Core read-only probes:
@@ -199,6 +199,25 @@ The CLI matrix was checked directly:
 
 All destructive verification used `bin/fm-herdr-lab.sh` with a non-default `fm-lab-` name and a byte-identical default-session tripwire.
 No ambient `herdr server stop` command is a supported test operation.
+
+### Crew board and pane labels
+
+Verified on 2026-10-29 with Herdr 0.9.5 protocol 22 on macOS through the guarded named-session lab.
+
+```sh
+FM_TEST_HERDR_BOARD=1 bash tests/fm-board-herdr-e2e.test.sh
+```
+
+Observed output:
+
+```text
+Herdr 0.9.5 / protocol 22
+ok - real Herdr: labels, rendered board, adjacent placement, reuse, and closed-pane recovery
+```
+
+The test includes a PATH longer than the canonical terminal input limit, checks mode 0700 on the generated viewer script, and waits for a real shell prompt before launch.
+Its teardown verifies that the live default session is unchanged.
+This test covers presentation and shell startup, independently of worker harness choice; canonical fleet state remains owned by `bin/fm-fleet-snapshot.sh`.
 
 ### Prune and respawn
 

@@ -41,6 +41,10 @@ export FM_GATE_REFUSE_BYPASS=1
 # few assertions about real channel resolution strip it with `env -u`.
 export FM_NOTIFY_EXEC=discard
 
+# Presentation tests explicitly enable their isolated board; all other tests
+# must never create UI panes through inherited desktop runtime variables.
+export FM_BOARD_DISABLED=1
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034
