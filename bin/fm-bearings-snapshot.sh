@@ -39,6 +39,9 @@
 # waste capacity, and --all-landed switches back to the complete global newest-first
 # order.
 #
+# candidate_prs retains head, merge_state, observed_at and check_runs (name,
+# context, status, state, conclusion, startedAt) for offline board enrichment.
+#
 # Flags:
 #   (default)        compact projection, TOON, local-only
 #   --json           the same projected model as JSON (machine/debug; parity form)
@@ -232,10 +235,10 @@ EOF
       if [ "$ALL_PR_REPOS" != 1 ] && [ "$nrepos" -ge "$FM_BEARINGS_PR_REPOS" ]; then break; fi
       nrepos=$((nrepos + 1))
       out=$(gh_bounded pr list --repo "$repo" --state open --limit "$pr_fetch_limit" \
-        --json number,title,url,headRefName,reviewDecision,mergeable,statusCheckRollup 2>/dev/null) \
+        --json number,title,url,headRefName,reviewDecision,mergeable,mergeStateStatus,headRefOid,statusCheckRollup 2>/dev/null) \
         || { nwarn=$((nwarn + 1)); continue; }
       [ -n "$out" ] || out='[]'
-      repo_result=$(printf '%s' "$out" | jq --arg repo "$repo" --argjson limit "$FM_BEARINGS_PR_LIMIT" '
+      repo_result=$(printf '%s' "$out" | jq --arg repo "$repo" --arg observed "$NOW" --argjson limit "$FM_BEARINGS_PR_LIMIT" '
         [ .[] | {
           num:(.number|tostring),
           repo:$repo,
@@ -243,6 +246,10 @@ EOF
           url:(.url // "-"),
           review:(.reviewDecision // "none"),
           mergeable:(.mergeable // "UNKNOWN"),
+          head:(.headRefOid // null),
+          merge_state:(.mergeStateStatus // "UNKNOWN"),
+          observed_at:$observed,
+          check_runs:[(.statusCheckRollup // [])[] | {name,context,status,state,conclusion,startedAt}],
           checks:(
             (.statusCheckRollup // []) as $c
             | if ($c|length) == 0 then "none"

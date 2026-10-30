@@ -10,7 +10,7 @@ command -v herdr >/dev/null || { echo 'skip: herdr not installed'; exit 0; }
 original_path=$PATH
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-board-e2e.XXXXXX")
 HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
-HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-board-v2)
+HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-board-tab-sections)
 cleanup() {
   local rc=$?
   trap - EXIT
@@ -83,16 +83,95 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 0.2
 done
 [ "$rendered" = 1 ] || fail 'board viewer did not render'
+# Exercise section keys on a stable offline fixture in an independent lab pane.
+keys_pane=$(lab workspace create --label board-section-keys | jq -r '.result.root_pane.pane_id')
+python3 - "$ROOT" "$TMP_ROOT" "$HERDR_LAB_SESSION" <<'PYKEYS'
+import importlib.util, json, pathlib, shlex, sys
+root, tmp, session = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('board_fixture', root + '/tests/fm-board.test.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+home = pathlib.Path(tmp) / 'keys-home'
+(home / 'state').mkdir(parents=True)
+snap = m.sequence_fixture()
+snap['fm_home'] = str(home)
+snap['tasks'].append(m.fixture()['tasks'][6])
+for record in snap['backlog']['records']:
+    record['since'] = '2026-10-28'
+path = pathlib.Path(tmp) / 'keys.json'
+path.write_text(json.dumps(snap))
+import os, subprocess
+subprocess.run([root + '/bin/fm-board.sh', 'render', '--snapshot', str(path)],
+               env=dict(os.environ, FM_HOME=str(home)), check=True)
+launch = pathlib.Path(tmp) / 'keys-view.sh'
+launch.write_text('#!/bin/sh\nexec ' + shlex.join(['env', 'FM_HOME=' + str(home),
+    'FM_BOARD_DISABLED=1', 'HERDR_SESSION=' + session, 'NO_COLOR=',
+    'python3', root + '/bin/fm-board.py', 'view']) + '\n')
+launch.chmod(0o700)
+PYKEYS
+lab pane wait-output "$keys_pane" --regex '[#$%>❯➜][ \t]*$' --lines 8 --timeout 5000 >/dev/null
+lab pane run "$keys_pane" "sh '$TMP_ROOT/keys-view.sh'"
+wait_key_frame() {
+  lab pane wait-output "$keys_pane" --regex "$1" --lines 100 --timeout 5000 >/dev/null
+}
+wait_key_frame 'Needs you now'
+if [ -n "${FM_BOARD_EVIDENCE_DIR:-}" ]; then
+  mkdir -p "$FM_BOARD_EVIDENCE_DIR"
+  lab pane read "$keys_pane" --source visible --format ansi --raw > "$FM_BOARD_EVIDENCE_DIR/before-tab.ansi"
+fi
+lab pane send-keys "$keys_pane" tab
+wait_key_frame 'In motion'
+lab pane send-keys "$keys_pane" tab
+wait_key_frame 'Nobody is blocked'
+if [ -n "${FM_BOARD_EVIDENCE_DIR:-}" ]; then
+  lab pane read "$keys_pane" --source visible --format ansi --raw > "$FM_BOARD_EVIDENCE_DIR/after-queued.ansi"
+fi
+lab pane send-keys "$keys_pane" tab
+wait_key_frame 'Bring back:'
+lab pane send-keys "$keys_pane" tab
+wait_key_frame 'Needs you now'
+# Literal CSI Z is Shift-Tab's terminal encoding, independent of GUI bindings.
+lab pane send-text "$keys_pane" $'\033[Z'
+wait_key_frame 'Bring back:'
+for section in 1 2 3 4; do
+  lab pane send-text "$keys_pane" "$section"
+  case "$section" in
+    1) wait_key_frame 'Needs you now' ;;
+    2) wait_key_frame 'In motion'
+       if [ -n "${FM_BOARD_EVIDENCE_DIR:-}" ]; then
+         lab pane read "$keys_pane" --source visible --format ansi --raw > "$FM_BOARD_EVIDENCE_DIR/after-moving.ansi"
+       fi ;;
+    3) wait_key_frame 'Nobody is blocked' ;;
+    4) wait_key_frame 'Bring back:' ;;
+  esac
+done
+lab pane send-text "$keys_pane" q
+lab pane wait-output "$keys_pane" --regex '[#$%>❯➜][ \t]*$' --lines 8 --timeout 5000 >/dev/null
+lab pane run "$keys_pane" "sh '$TMP_ROOT/keys-view.sh'"
+wait_key_frame 'Bring back:'
+lab pane send-text "$keys_pane" q
+printf '%s\n' 'section keys: Tab forward/wrap, CSI Z backward, 1-4 jumps, restart retains Parked'
 lab pane close "$board" >/dev/null
 "$ROOT/bin/fm-board.sh" refresh --snapshot "$TMP_ROOT/fixture.json"
 [ "$(count)" = 1 ] || fail 'closed board was not recreated exactly once'
 # All classification cases travel through the same public refresh interface.
 python3 - "$ROOT" "$TMP_ROOT" "$worker" "$HERDR_LAB_SESSION" <<'PY'
-import json, pathlib, subprocess, sys
+import json, pathlib, subprocess, sys, time
 root, tmp, pane, session = sys.argv[1:]
 p = pathlib.Path(tmp) / 'fixture.json'
 s = json.loads(p.read_text())
 t = s['tasks'][0]
+def refresh_label(expected):
+    # Refresh is deliberately fail-soft when the viewer owns board.lock.
+    # Await the observable label instead of assuming that one call published it.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        subprocess.run([root+'/bin/fm-board.sh', 'refresh', '--snapshot', str(p)], check=True)
+        info = json.loads(subprocess.check_output(['herdr', 'pane', 'get', pane, '--session', session]))
+        if info['result']['pane']['label'] == expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError((expected, info))
 for state, detail, expected, backlog in [
     ('working', 'Implementing', 'WORKING', {}), ('working', 'ci running', 'CI RUNNING', {}),
     ('working', 'Implementing', 'WAITING: Earlier step',
@@ -109,18 +188,29 @@ for state, detail, expected, backlog in [
     t['backlog'] = dict(id=t['id'], title='Test work', repo='continuo', **backlog)
     s['backlog']['records'] = [dict(id='earlier', title='Earlier step', structured=True, repo='continuo', state='in_flight')]
     t['current_state'] = dict(state=state, detail=detail)
-    t['pr'] = {} if expected == 'DONE' else dict(url='https://github.com/example/continuo/pull/1')
+    t['pr'] = dict(url='https://github.com/example/continuo/pull/1',
+                   observed_at=s['generated'], merge_state='CLEAN',
+                   check_runs=[dict(name='tests', status='COMPLETED', conclusion='SUCCESS')]) if expected.startswith('READY:') else {}
     p.write_text(json.dumps(s))
-    subprocess.run([root+'/bin/fm-board.sh', 'refresh', '--snapshot', str(p)], check=True)
-    info = json.loads(subprocess.check_output(['herdr', 'pane', 'get', pane, '--session', session]))
-    actual = info['result']['pane']['label']
-    assert actual == t['id'] + ' - ' + expected, (actual, expected)
+    refresh_label(t['id'] + ' - ' + expected)
+for runs, expected in [
+    ([dict(name='tests', status='IN_PROGRESS', startedAt='2026-10-30T07:53:00Z'),
+      dict(name='lint', state='PENDING')], 'CI RUNNING: 2 pending, 7m elapsed'),
+    ([dict(name='lint', status='COMPLETED', conclusion='FAILURE')], 'CI FAILED: lint'),
+    ([], 'CHECKS UNKNOWN')]:
+    t['hints'] = {}
+    t['backlog'] = dict(id=t['id'], title='CI test', repo='continuo')
+    t['current_state'] = dict(state='done', detail='PR opened')
+    t['pr'] = dict(url='https://github.com/example/continuo/pull/1',
+                   observed_at=s['generated'], merge_state='CLEAN', check_runs=runs)
+    p.write_text(json.dumps(s))
+    refresh_label(t['id'] + ' - ' + expected)
 # Exercise the same three reported misreads on a second mate's aggregate pane.
 s['tasks'] = [dict(id='mate', kind='secondmate', backend='herdr',
                    endpoint=dict(target=session + ':' + pane, exists=True))]
 for state, detail, backlog, expected in [
     ('working', 'Implementing', dict(unresolved_blocker_ids=['earlier']), 'WAITING: Earlier step'),
-    ('done', 'checks green', dict(hold_kind='captain', captain_actionable=True), 'READY: merge?'),
+    ('done', 'checks green', dict(hold_kind='captain', captain_actionable=True), 'CHECKS UNKNOWN'),
     ('blocked', 'Wait for captain word', dict(hold_kind='captain', hold_reason='Wait for captain word'), 'HOLDING')]:
     s['secondmate_current'] = dict(records=[dict(id='mate',
         current=dict(state='active_child_work' if state == 'working' else 'captain_decision'),
@@ -130,9 +220,7 @@ for state, detail, backlog, expected in [
         endpoints=[dict(id='child', state=state, detail=detail,
                         pr_url='https://github.com/example/continuo/pull/1')])])
     p.write_text(json.dumps(s))
-    subprocess.run([root+'/bin/fm-board.sh', 'refresh', '--snapshot', str(p)], check=True)
-    info = json.loads(subprocess.check_output(['herdr', 'pane', 'get', pane, '--session', session]))
-    assert info['result']['pane']['label'] == 'mate - ' + expected, info
+    refresh_label('mate - ' + expected)
 
 PY
 # fm-goto lands on the worker: Herdr cannot focus a pane by id, so it focuses the owning tab.
@@ -157,4 +245,4 @@ lab tab focus "$other_tab" >/dev/null
 lab pane close "$worker" >/dev/null
 "$ROOT/bin/fm-goto.sh" goto-task >/dev/null 2>&1 && fail 'fm-goto must refuse a closed pane'
 export PATH="$original_path"
-pass 'real Herdr: labels, rendered board, adjacent placement, reuse, closed-pane recovery, and go-to-pane focus'
+pass 'real Herdr: labels, rendered board, adjacent placement, reuse, closed-pane recovery, go-to-pane focus, and section keys'

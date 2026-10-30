@@ -7,12 +7,12 @@ non-interactive `fm-board.py view --once` frame used by tests and documentation.
 
 Colour and glyph choices (docs/crew-board.md "Terminal board"):
   yellow and peach need you, green ready to merge or done, blue running,
-  grey waiting, queued and parked, mauve links and the selection, red only for
-  a genuine failure. FM_BOARD_ICONS=plain (or config/board-icons containing
+  grey waiting, queued and parked, mauve links and the selection, peach for
+  a failure with an explicit label. FM_BOARD_ICONS=plain (or config/board-icons containing
   "plain") swaps Nerd Font powerline glyphs for plain Unicode; NO_COLOR removes
   colour and implies plain glyphs.
 Keys: j/k move, Enter go to the worker's pane, o open PR (else brief), b brief,
-r report, f summary/full detail, PgUp/PgDn/Home/End scroll, q quit.
+r report, Tab/Shift-Tab section, 1-4 jump, f summary/full detail, PgUp/PgDn/Home/End scroll, q quit.
 """
 import datetime as dt
 import json
@@ -39,7 +39,7 @@ NERD = dict(capl='', capr='', soft='', db='', ask='', merge=''
 PLAIN = dict(capl='', capr='', soft='|', db='$', ask='?', merge='+', eye='o', flag='!', fail='x',
              done='*', run='>', wait='.', park='=', need='!', queued='?', folder='', clock='',
              go='Enter', bar='|')
-STATE_COLOUR = dict(done='green', run='blue', wait='sub', need='yellow', fail='red', queued='sub')
+STATE_COLOUR = dict(done='green', run='blue', wait='sub', need='yellow', fail='peach', queued='sub')
 SUMMARY_NEED, SUMMARY_MOVING = 5, 4
 
 
@@ -116,14 +116,25 @@ def item_links(model, item):
     return links
 
 
-def targets_of(model):
+SECTIONS = ('Needs you now', 'In motion', 'Queued', 'Parked')
+
+
+def targets_of(model, section=None):
+    if section is not None:
+        if section == 0:
+            return [dict(kind='need', item=i) for i in model.get('need', [])]
+        if section == 1:
+            return [dict(kind='step', item=s, programme=p) for p in model.get('programmes', []) for s in p['steps']]
+        kind = ('queued', 'parked')[section - 2]
+        return [dict(kind=kind, item=i) for i in model.get(kind, [])]
+
     return [dict(kind='need', item=i) for i in model.get('need', [])] + \
            [dict(kind='prog', item=p) for p in model.get('programmes', [])]
 
 
 def target_step(target):
     """The item itself, or a programme's running step (else its first step)."""
-    if target['kind'] == 'need':
+    if target['kind'] != 'prog':
         return target['item']
     steps = target['item']['steps']
     return next((s for s in steps if s['state'] == 'run'), next((s for s in steps if s['state'] != 'done'), steps[0]))
@@ -136,14 +147,22 @@ def loc_line(G, loc):
             seg(loc['tab'], 'sub'), seg(' ' + G['soft'] + ' ', 'overlay0'), seg(loc['pane'], 'sub')]
 
 
-def bar_line(G, model, w):
+def bar_line(G, model, w, section=None):
     c = model['counts']
     tabs = [('Need ' + str(c['need']), 'yellow' if c['need'] else 'surface0', 'base' if c['need'] else 'text'),
             ('Moving ' + str(c['moving']), 'surface0', 'text'), ('Queued ' + str(c['queued']), 'surface0', 'text'),
             ('Parked ' + str(c['parked']), 'surface0', 'text')]
     left = []
-    for label, bg, fg in tabs:
+    for n, (label, bg, fg) in enumerate(tabs):
+        if section is not None:
+            bg, fg = ('mauve', 'base') if n == section else ('surface0', 'text')
+            label = ('>' if n == section else '') + str(n + 1) + ' ' + label
         left += pill(G, label, bg, fg) + [seg(' ')]
+    if width(left) > w:
+        left = []
+        for n, key in enumerate(('need', 'moving', 'queued', 'parked')):
+            label = ('>' if n == section else '') + str(n + 1) + key[0].upper() + ':' + str(c[key])
+            left += pill(G, label, 'mauve' if n == section else 'surface0', 'text')
     try:
         stamp = dt.datetime.fromisoformat(model['generated'].replace('Z', '+00:00')).astimezone().strftime('%H:%M')
     except (KeyError, ValueError):
@@ -194,7 +213,7 @@ def programme_line(G, entry, w, selected):
     if len(p['steps']) > 6:
         chain.append(seg('+' + str(len(p['steps']) - 6), 'sub'))
     current = target_step(entry)
-    right = [seg(current['word'] + ' ', STATE_COLOUR[current['state']])]
+    right = [seg(clip(current['word'], max(14, w // 2)) + ' ', STATE_COLOUR[current['state']])]
     room = w - 3 - width(chain) - 2 - width(right) - 1
     return pad_between(mark + chain + [seg('  ' + clip(programme_title(p), room), 'text')], right, w)
 
@@ -246,8 +265,57 @@ def quiet_lines(G, model, w, full):
     return lines
 
 
-def build(model, w, selected, full):
+def section_lines(model, w, selected, full, section):
+    G, lines, span = glyphs(), [], (0, 0)
+    targets = targets_of(model, section)
+    lines += [bar_line(G, model, w, section), [], heading(SECTIONS[section], 'mauve', str(len(targets)), w)]
+    if section == 2:
+        lines += [[seg('  Filed; not yet asked. Nobody is blocked.', 'sub')]]
+    if not targets:
+        lines += [[seg('  ' + ('Nothing needs you right now.', 'Nothing is running.', 'Nothing queued', 'Nothing parked')[section], 'sub')]]
+    group = None
+    for n, entry in enumerate(targets):
+        item, chosen = entry['item'], n == selected
+        start = len(lines)
+        mark = [seg(' ' + G['bar'] + ' ' if chosen else '   ', 'mauve')]
+        if section == 0:
+            lines += need_lines(G, model, entry, w, chosen, chosen or full, full)
+        elif section == 1:
+            p = entry['programme']
+            if group != p['key']:
+                group = p['key']
+                lines += [[seg('  ' + clip(programme_title(p), w - 3), 'text', bold=True)]]
+                if p['cycle']:
+                    lines += [[seg('  Dependency cycle: check before continuing', 'peach')]]
+            state = item['state']
+            after = ' (after ' + ', '.join(item['after']) + ')' if item['after'] and not p['linear'] else ''
+            lines += [pad_between(mark + [seg(G[state] + ' ' + clip(item['title'] + after, w - 22), STATE_COLOUR[state])], [seg(item['word'], 'sub')], w)]
+            if chosen or full:
+                lines += [mark + [seg(clip(item['action'], w - 3), 'sub')]]
+                lines += [mark + loc_line(G, item.get('loc'))] if item.get('loc') else []
+                lines += [mark + [seg(label + ' ', 'mauve', link=url, underline=True) for label, url in item_links(model, item)]]
+            if item != p['steps'][-1]:
+                lines += [mark + [seg('│' if state == 'run' else '╎', 'sub')]]
+        else:
+            if group != item['programme']:
+                group = item['programme']
+                lines += [[seg('  ' + clip(group, w - 3), 'text', bold=True)]]
+            suffix = ' - filed ' + item['age'] if section == 2 else ''
+            lines += [mark + [seg(clip(item['title'], max(8, w - len(suffix) - 3)) + suffix, 'text')]]
+            if section == 3 or chosen or full:
+                prefix = 'Bring back: ' if section == 3 else ''
+                lines += [mark + [seg(clip(prefix + item['action'], w - 3), 'sub')]]
+            if chosen or full:
+                lines += [mark + [seg(label + ' ', 'mauve', link=url, underline=True) for label, url in item_links(model, item)]]
+        if chosen:
+            span = start, len(lines) - 1
+    return lines, span
+
+
+def build(model, w, selected, full, section=None):
     """Body lines plus the first and last line of the selected target."""
+    if section is not None:
+        return section_lines(model, w, selected, full, section)
     G = glyphs()
     targets, span, gap = targets_of(model), (0, 0), ([[]] if full else [])
     lines = [bar_line(G, model, w), []]
@@ -283,7 +351,7 @@ def footer(G, w, message):
     rule = [seg('─' * w, 'surface1')]
     if message:
         return [rule, [seg(' ' + clip(message[0], w - 2), message[1])]]
-    keys, out = [('j/k', 'move'), (G['go'], 'go'), ('o', 'PR'), ('b', 'brief'), ('r', 'report'), ('f', 'detail'), ('q', 'quit')], []
+    keys, out = [('Tab', 'next section'), ('j/k', 'move'), (G['go'], 'go'), ('o', 'PR'), ('b', 'brief'), ('r', 'report'), ('f', 'detail'), ('q', 'quit')], []
     for key, label in keys:
         part = [seg(' ' + key, 'mauve', bold=True), seg(' ' + label + ' ', 'sub')]
         if width(out) + width(part) <= w:
@@ -291,16 +359,19 @@ def footer(G, w, message):
     return [rule, out]
 
 
-def frame(model, w, h, selected=0, full=False, off=0, message=None):
+def frame(model, w, h, selected=0, full=False, off=0, message=None, section=None):
     """Visible rows (body then two footer rows) and the scroll offset that shows the selection."""
-    body, (first, last) = build(model, w, selected, full)
+    body, (first, last) = build(model, w, selected, full, section)
     room = max(1, h - 2)
     if first < off:
         off = first
     if last >= off + room:
         off = last - room + 1
     off = max(0, min(off, max(0, len(body) - room)))
-    view = body[off:off + room]
+    if section is not None and off > 0 and room > 1:
+        view = [body[0]] + body[off + 1:off + room]
+    else:
+        view = body[off:off + room]
     view += [[] for _ in range(room - len(view))]
     return [fit(line, w) for line in view + footer(glyphs(), w, message)], off, len(body)
 
@@ -343,13 +414,17 @@ def act(key, entry, model, script):
     if entry is None:
         return 'Nothing is selected.', 'sub'
     step = target_step(entry)
+    if key == '\r' and entry['kind'] in ('queued', 'parked'):
+        url = file_url(step['detail'])
+        subprocess.run(opener() + [url], capture_output=True, timeout=10)
+        return 'Opened Detail.', 'green'
     if key == '\r':
         if not step.get('goto'):
             return 'No live pane is recorded for this item.', 'peach'
         result = subprocess.run([str(script / 'fm-goto.sh'), step['id']], capture_output=True, text=True, timeout=15,
                                 env=dict(os.environ, FM_HOME=step['goto']['home']))
         text = (result.stdout or result.stderr).strip().splitlines()
-        return (text[-1] if text else 'Went to the worker pane.'), 'green' if result.returncode == 0 else 'red'
+        return (text[-1] if text else 'Went to the worker pane.'), 'green' if result.returncode == 0 else 'peach'
     links = item_links(model, step)
     wanted = {'o': [l for l in links if l[0].startswith('PR')] or [l for l in links if l[0] == 'Brief'],
               'b': [l for l in links if l[0] == 'Brief'], 'r': [l for l in links if l[0] == 'Report']}[key]
@@ -363,7 +438,7 @@ def act(key, entry, model, script):
 
 def parse_keys(data):
     """Split one read into keys; escape sequences become names, unknown ones are dropped."""
-    table = {b'\x1b[A': 'up', b'\x1b[B': 'down', b'\x1b[5~': 'pgup', b'\x1b[6~': 'pgdn', b'\x1b[H': 'home',
+    table = {b'\x1b[Z': 'backtab', b'\x1b[A': 'up', b'\x1b[B': 'down', b'\x1b[5~': 'pgup', b'\x1b[6~': 'pgdn', b'\x1b[H': 'home',
              b'\x1b[F': 'end', b'\x1b[1~': 'home', b'\x1b[4~': 'end', b'\x1bOA': 'up', b'\x1bOB': 'down'}
     keys, i = [], 0
     while i < len(data):
@@ -393,6 +468,13 @@ def run(home, script):
     out.flush()
     tty.setcbreak(fd)
     selected, full, off, message, until, refreshed, mtime, process = 0, False, 0, None, 0, 0, None, None
+    preference = Path(home) / 'state/board-view.json'
+    session = os.environ.get('HERDR_SESSION', str(os.getsid(0)))
+    try:
+        prior = json.loads(preference.read_text())
+        section = prior['section'] if prior['session'] == session and prior['section'] in range(4) else None
+    except (OSError, ValueError, KeyError, TypeError):
+        section = None
     previous, model = [], None
     try:
         while True:
@@ -410,9 +492,9 @@ def run(home, script):
             if model is None:
                 rows_out = [[seg('  Waiting for the board...', 'sub')]] + [[] for _ in range(rows - 3)] + footer(glyphs(), columns, None)
             else:
-                count = len(targets_of(model))
+                count = len(targets_of(model, section))
                 selected = max(0, min(selected, count - 1))
-                rows_out, off, _ = frame(model, columns, rows, selected, full, off, message)
+                rows_out, off, _ = frame(model, columns, rows, selected, full, off, message, section)
             color = not os.environ.get('NO_COLOR')
             ansi = [to_ansi(parts, color) for parts in rows_out]
             if resized[0] or len(previous) != len(ansi):
@@ -426,10 +508,15 @@ def run(home, script):
             if not select.select([fd], [], [], 1.0)[0]:
                 continue
             for key in parse_keys(os.read(fd, 64)):
-                targets = targets_of(model) if model else []
+                targets = targets_of(model, section) if model else []
                 if key == 'q':
                     return
-                if key in ('j', 'down'):
+                if key in ('\t', 'backtab', '1', '2', '3', '4'):
+                    current = section if section is not None else 0
+                    section = int(key) - 1 if key in '1234' else (current + (-1 if key == 'backtab' else 1)) % 4
+                    selected, off, message = 0, 0, None
+                    preference.write_text(json.dumps(dict(session=session, section=section)))
+                elif key in ('j', 'down'):
                     selected += 1
                 elif key in ('k', 'up'):
                     selected -= 1
@@ -448,7 +535,7 @@ def run(home, script):
                     try:
                         message = act('\r' if key == '\n' else key, targets[selected], model, script)
                     except (OSError, subprocess.SubprocessError) as exc:
-                        message = (str(exc), 'red')
+                        message = (str(exc), 'peach')
                     until = time.monotonic() + 4
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
@@ -456,10 +543,11 @@ def run(home, script):
         out.flush()
 
 
-def once(home, w, h, selected, full):
+def once(home, w, h, selected, full, section=None):
     model = load_model(home)
     if model is None:
         raise ValueError('no board model yet; run `fm-board.py render` first')
-    rows, _, _ = frame(model, w, h or len(build(model, w, selected, full)[0]) + 2, selected, full)
+    section = section - 1 if section is not None else None
+    rows, _, _ = frame(model, w, h or len(build(model, w, selected, full, section)[0]) + 2, selected, full, section=section)
     color = not os.environ.get('NO_COLOR')
     sys.stdout.write('\n'.join(to_ansi(parts, color) for parts in rows) + '\n')
