@@ -22,9 +22,9 @@
 #     resolves only when its structured record is Done, and missing ids stay open.
 #   tasks[]: one row per state/<id>.meta, sorted by id.
 #     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
-#     state, source, detail, and raw line separately.
+#     state, source, detail, raw line and parsed end_state separately.
 #     paths.status_log.last_event is historical wake-event data only, never
-#     current state.
+#     current state; its end_state fields are historical worker evidence.
 #     hints.open_decisions is the keyed open-decision set returned by
 #     fm-classify-lib.sh's authoritative status_open_decisions fold and reconciled
 #     against current_state; hints.pending_decision and hints.blocked_event are
@@ -32,7 +32,8 @@
 #     endpoint.exists is the cheap backend endpoint-presence read.
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
-#     pr carries locally recorded url, source, and optional head; no CI lookup.
+#     pr carries locally recorded url, references, source, and optional head;
+#     references retains all status-log PR/MR URLs; no CI lookup.
 #   scout_reports[]: present data/<id>/report.md pointers.
 #   main_inventory: {valid,reason,orphan_in_flight[],unstructured_current_count} -
 #     main-home current-inventory checks shared with secondmate_home_summary_json
@@ -198,7 +199,7 @@ last_nonempty_line() {  # <file>
 }
 
 crew_state_json() {  # <id>
-  local id=$1 raw rest state source detail sep
+  local id=$1 raw rest state source detail sep end_state='{}'
   raw=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
@@ -224,8 +225,19 @@ crew_state_json() {  # <id>
       esac
       ;;
   esac
+  case "$detail" in
+    *"$sep"end-state:*)
+      end_state=${detail##*"$sep"end-state: }
+      if printf '%s' "$end_state" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        detail=${detail%"$sep"end-state:*}
+      else
+        end_state='{}'
+      fi
+      ;;
+  esac
   jq -n --arg raw "$raw" --arg state "$state" --arg source "$source" --arg detail "$detail" \
-    '{state:$state,source:$source,detail:$detail,raw:$raw}'
+    --argjson end_state "$end_state" \
+    '{state:$state,source:$source,detail:$detail,raw:$raw,end_state:$end_state}'
 }
 
 status_event_json() {  # <status-log>
@@ -242,12 +254,13 @@ status_event_json() {  # <status-log>
     --arg verb "$verb" \
     --arg note "$note" \
     --argjson present "$(bool_json "$present")" \
-    '{path:$path,present:$present,kind:"event_history",last_event:{state:$verb,note:$note,raw:$raw}}'
+    --argjson end_state "$(status_end_state_json "$raw")" \
+    '{path:$path,present:$present,kind:"event_history",last_event:{state:$verb,note:$note,raw:$raw,end_state:$end_state}}'
 }
 
-first_pr_url_in_file() {  # <file>
+latest_pr_url_in_file() {  # <file>
   [ -f "$1" ] || return 1
-  grep -Eo 'https?://[^[:space:])"]+/pull/[0-9]+' "$1" 2>/dev/null | head -1
+  grep -Eo 'https://[^[:space:])"|]+/(pull|-/merge_requests)/[0-9]+' "$1" 2>/dev/null | tail -1
 }
 
 backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
@@ -405,7 +418,7 @@ task_json_lines() {
   local remote_host remote_root remote_state remote_rc remote_home_present
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
-  local open_decisions_tsv open_decisions_json
+  local open_decisions_tsv open_decisions_json pr_references
 
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
@@ -435,13 +448,20 @@ task_json_lines() {
     pr=$(meta_value "$meta" pr)
     pr_source=meta
     if [ -z "$pr" ]; then
-      pr_from_status=$(first_pr_url_in_file "$status_log" || true)
+      pr_from_status=$(latest_pr_url_in_file "$status_log" || true)
       pr=$pr_from_status
       pr_source=status_event
     fi
     if [ -z "$pr" ]; then
       pr_source=absent
     fi
+
+    pr_references=$({
+      [ -z "$pr" ] || printf '%s\n' "$pr"
+      if [ -f "$status_log" ]; then
+        grep -Eo 'https://[^[:space:])"|]+/(pull|-/merge_requests)/[0-9]+' "$status_log" || true
+      fi
+    } | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')
 
     current_json=$(crew_state_json "$id")
     event_json=$(status_event_json "$status_log")
@@ -543,6 +563,7 @@ task_json_lines() {
       --arg remote_host "$remote_host" \
       --arg remote_root "$remote_root" \
       --arg pr "$pr" \
+      --argjson pr_references "$pr_references" \
       --arg pr_source "$pr_source" \
       --arg pr_head "$(meta_value "$meta" pr_head)" \
       --arg agent_alive "$agent_alive" \
@@ -582,7 +603,7 @@ task_json_lines() {
                   elif $agent_alive == "alive" or $agent_alive == "dead" then $agent_alive
                   else "unknown" end),
           observed_at:$observed_at,freshness:"fresh"},
-        pr:{url:($pr | if . == "" then null else . end),source:$pr_source,head:($pr_head | if . == "" then null else . end)},
+        pr:{url:($pr | if . == "" then null else . end),references:$pr_references,source:$pr_source,head:($pr_head | if . == "" then null else . end)},
         hints:{
           pending_decision:$pending_decision,
           blocked_event:$blocked_event,
@@ -765,7 +786,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
         endpoints:([$tasks[] | . as $task
           | ([$backlog.records[]? | select(.id == $task.id)][0] // {}) as $row
           | {id,state:.current_state.state,source:.current_state.source,
-          detail:.current_state.detail,title:($row.title // .id),
+          detail:.current_state.detail,end_state:(.current_state.end_state // {}),title:($row.title // .id),
           repo:($row.repo // .project),pr_url:(.pr.url // $row.pr_url),
           endpoint:(.endpoint + {target:((.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
         counts:{

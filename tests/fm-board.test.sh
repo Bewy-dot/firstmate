@@ -4,3 +4,4 @@ set -eu
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 python3 "$ROOT/tests/fm-board.test.py"
+python3 "$ROOT/tests/fm-pr-state.test.py"

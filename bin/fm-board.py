@@ -16,6 +16,7 @@ Besides board.md and board-full.md, every render writes state/board-model.json,
 the structured projection the terminal viewer (fm_board_tui.py) draws.
 --pr-snapshot imports the existing opt-in fm-bearings.v1 candidate_prs evidence
 by exact URL and recorded head, without making any network calls.
+Normal renders read the asynchronous fm_pr_state cache and schedule a refresh.
 """
 import argparse
 import datetime as dt
@@ -111,97 +112,138 @@ def reported_state(task, url):
     verb, note = event.get('state'), plain(event.get('note'))
     if verb == 'paused' and url and re.search(MERGE_WORD, note, re.I):
         return 'done', note, True
+    if verb == 'needs-decision':
+        return 'parked', note or detail, True
     if verb in ('working', 'done', 'paused', 'blocked', 'failed'):
         return verb, note or detail, True
     return state, detail, False
 
 
 def pr_checks(pr, now=None):
-    """Use recorded forge checks, never worker prose as evidence of green CI.
-
-    check_runs and merge_state are retained by the opt-in bearings PR path.
-    CLEAN plus a nonempty successful rollup establishes passing merge checks;
-    an empty/missing rollup, an old observation, or a head mismatch stays unknown.
-    """
-    unknown = ('CHECKS UNKNOWN', SECTIONS[0], 'Checks unknown; no current PR check result is recorded')
+    """One display mapping for live cache, offline fixtures and worker evidence."""
     if not pr or not pr.get('url'):
         return None
+    if pr.get('state') in ('MERGED', 'CLOSED'):
+        state = pr['state']
+        return state, SECTIONS[2], 'Merged' if state == 'MERGED' else 'Closed without merge'
+    if pr.get('error'):
+        return 'PR FETCH FAILED: ' + plain(pr['error']), SECTIONS[0], plain(pr['error'])
     if pr.get('head_mismatch'):
-        return unknown
-    try:
-        observed = dt.datetime.fromisoformat(pr['observed_at'].replace('Z', '+00:00'))
-        if now and not 0 <= (now - observed).total_seconds() <= 300:
-            return unknown
-    except (KeyError, TypeError, ValueError):
-        return unknown
+        return 'PR HEAD CHANGED', SECTIONS[0], 'Recorded PR head differs from the offline evidence; refresh PR state'
+    if pr.get('pending_fetch'):
+        return 'CI FETCHING', SECTIONS[1], 'Fetching PR state in the background'
+    unavailable = ('CI NOT FETCHED', SECTIONS[0], 'PR checks not fetched (offline snapshot)')
+    if not pr.get('live') and not pr.get('reported'):
+        try:
+            observed = dt.datetime.fromisoformat(pr['observed_at'].replace('Z', '+00:00'))
+            if now and not 0 <= (now - observed).total_seconds() <= 300:
+                return 'CI EVIDENCE EXPIRED', SECTIONS[0], 'PR evidence is older than five minutes; refresh PR state'
+        except (KeyError, TypeError, ValueError):
+            return unavailable
     checks = pr.get('check_runs')
-    if not isinstance(checks, list) or not checks:
-        return unknown
-    failed, pending, other = [], [], []
+    if not isinstance(checks, list):
+        return unavailable
+    suffix = ' (cached; refreshing)' if pr.get('stale') else ' (worker reported; confirming)' if pr.get('reported') else ''
+    if not checks:
+        return 'no checks configured', SECTIONS[0], 'No required checks configured' + suffix
+    failed, pending, other, passed = [], [], [], 0
     for check in checks:
         state = str(check.get('conclusion') or check.get('state') or check.get('status') or '').upper()
-        if state in ('FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'):
+        bucket = check.get('bucket')
+        if bucket in ('fail', 'cancel') or state in ('FAILURE', 'FAILED', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'CANCELED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'):
             failed.append(plain(check.get('name') or check.get('context') or 'unnamed check'))
-        elif state in ('QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING', 'REQUESTED', 'EXPECTED'):
+        elif bucket == 'pending' or state in ('QUEUED', 'IN_PROGRESS', 'RUNNING', 'PENDING', 'WAITING', 'MANUAL', 'CREATED', 'PREPARING', 'WAITING_FOR_RESOURCE', 'REQUESTED', 'EXPECTED'):
             pending.append(check)
-        elif state not in ('SUCCESS', 'NEUTRAL', 'SKIPPED'):
+        elif bucket in ('pass', 'skipping') or state in ('SUCCESS', 'NEUTRAL', 'SKIPPED'):
+            passed += 1
+        else:
             other.append(check)
     if failed:
         names = ', '.join(failed)
-        return 'CI FAILED: ' + short(names, 48), SECTIONS[0], 'CI failed: ' + names
+        return 'CI FAILED: ' + short(names, 48), SECTIONS[0], 'CI failed: ' + names + suffix
     if pending:
-        age = ''
         starts = []
-        for check in pending:
+        for check in checks:
             try:
                 started = dt.datetime.fromisoformat(check['startedAt'].replace('Z', '+00:00'))
                 if now and started <= now and started.year > 1970:
                     starts.append(started)
             except (KeyError, TypeError, ValueError):
                 pass
+        age = ', start time unavailable'
         if starts:
             minutes = int((now - min(starts)).total_seconds() // 60)
             age = ', ' + (str(minutes) + 'm elapsed' if minutes else 'under 1m elapsed')
-        label = 'CI RUNNING: ' + str(len(pending)) + ' pending' + age
-        return label, SECTIONS[1], label
-    if not other and pr.get('merge_state') == 'CLEAN':
-        return 'READY: merge?', SECTIONS[0], 'Give the merge word'
-    return unknown
+        label = f'CI RUNNING: {passed} of {len(checks)} checks passed' + age
+        return label, SECTIONS[1], label + suffix
+    if other:
+        names = ', '.join(plain(c.get('name') or c.get('context') or 'unnamed check') for c in other)
+        return 'CI RESPONSE INCOMPLETE', SECTIONS[0], 'Unrecognized check result for ' + names + '; refresh PR state'
+    return 'CI GREEN', SECTIONS[0], 'All required checks passed' + suffix
 
 
 def task_view(task, titles=None, merged=frozenset(), now=None):
     backlog = task.get('backlog') or {}
     decisions = task.get('hints', {}).get('open_decisions', [])
+    event = task.get('paths', {}).get('status_log', {}).get('last_event') or {}
     url = (task.get('pr') or {}).get('url') or backlog.get('pr_url')
     state, detail, inferred = reported_state(task, url)
+    fields = task.get('current_state', {}).get('end_state') or {}
+    if inferred or task.get('current_state', {}).get('source') == 'status-log':
+        fields = fields or event.get('end_state') or {}
+    if fields.get('pr') and fields['pr'] != 'none':
+        url = url or fields['pr']
+    pr = dict(task.get('pr') or {}, url=url)
+    # Structured worker evidence is better than prose; current forge observations win.
+    if fields and fields.get('pr') == url and not (pr.get('live') or pr.get('observed_at')):
+        check = fields['checks']
+        pr.update(reported=True, check_runs=[] if check == 'none' else [dict(name='worker-reported checks',
+                  state=dict(green='SUCCESS', running='PENDING', failed='FAILURE')[check])])
+        pr.pop('pending_fetch', None)
+    checks = pr_checks(pr, now)
+    if checks and fields and checks[0] not in ('MERGED', 'CLOSED'):
+        checks = (checks[0], checks[1], checks[2] + '; next: ' + fields['next'] + '; owner: ' + fields['owner'])
+    green = checks and checks[0] == 'CI GREEN'
+    if checks and checks[0] in ('MERGED', 'CLOSED'):
+        return checks
     if backlog.get('state') == 'done':
         return 'DONE', SECTIONS[2], 'Completed'
     questions = [d for d in decisions if d.get('verb') == 'needs-decision']
-    checks = pr_checks(dict(task.get('pr') or {}, url=url), now)
-    green = checks and checks[0].startswith('READY:')
     delivery_only = questions and all(re.search(MERGE_WORD, plain(d.get('summary')), re.I) for d in questions)
     review_asked = any(re.search(r'\breview\b.*\bPR\b|\bPR\b.*\breview\b', plain(d.get('summary')), re.I) for d in questions)
     if questions and not delivery_only and not review_asked:
         return 'NEEDS ANSWER', SECTIONS[0], '; '.join(plain(d['summary']) for d in questions)
     if url in merged and state in ('done', 'paused', 'unknown'):
-        return 'DONE', SECTIONS[2], 'Merged'
-    if checks and checks[0].startswith(('CI RUNNING', 'CI FAILED')):
+        return 'MERGED', SECTIONS[2], 'Merged'
+    if checks and checks[0].startswith(('CI RUNNING', 'CI FAILED', 'PR FETCH FAILED')):
         return checks
     if state == 'failed':
         return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
-    if url and review_asked:
-        return 'REVIEW', SECTIONS[0], 'Review the PR; ' + ('checks green' if green else 'checks unknown')
-    if url and state in ('done', 'paused', 'unknown'):
-        if green:
-            release_note = detail + ' ' + plain(task.get('paths', {}).get('status_log', {}).get('last_event', {}).get('note'))
-            apply = re.search(r'apply.*(?:database|migration)|(?:database|migration).*(?:must|needs?|awaiting|pending|before merge|to be applied)', release_note, re.I) and not re.search(r'already applied|has been applied', release_note, re.I)
-            return ('READY: apply + merge?' if apply else 'READY: merge?', SECTIONS[0],
-                    'Apply the production database change, then give the merge word' if apply else 'Give the merge word')
-        return checks
+    if state in ('blocked', 'parked'):
+        if backlog.get('hold_kind') == 'captain' or state == 'parked':
+            return 'HOLDING', SECTIONS[0], plain(backlog.get('hold_reason')) or detail or 'Awaiting your word to continue'
+        return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
     blockers = backlog.get('unresolved_blocker_ids') or []
     if blockers:
         names = ', '.join((titles or {}).get(key, key) for key in blockers)
         return 'WAITING: ' + short(names, 48), SECTIONS[1], 'Waiting on ' + names
+    if url and review_asked and checks and not green and not pr.get('live'):
+        return 'REVIEW', SECTIONS[0], 'Review the PR; ' + checks[2]
+    if url and checks:
+        if green or checks[0] == 'no checks configured':
+            if state == 'working':
+                return checks[0], SECTIONS[1], (detail or 'Worker running') + '; ' + checks[2]
+            release_note = detail + ' ' + plain(event.get('note'))
+            apply = fields.get('next') == 'prod-apply' or (re.search(r'apply.*(?:database|migration)|(?:database|migration).*(?:must|needs?|awaiting|pending|before merge|to be applied)', release_note, re.I) and not re.search(r'already applied|has been applied', release_note, re.I))
+            action = ('Apply the production database change, then give the merge word' if apply else
+                      'Review the PR' if review_asked or fields.get('next') == 'review' else
+                      'Give the merge word')
+            if fields.get('next') == 'nothing':
+                action = 'No next action reported'
+            elif fields.get('next') == 'captain-decision':
+                action = detail.split(' | ')[0]
+            return checks[0], checks[1], checks[2] + '; ' + action
+        return checks
     if backlog.get('hold_kind') == 'captain' or state == 'parked':
         return 'HOLDING', SECTIONS[0], plain(backlog.get('hold_reason')) or detail or 'Awaiting your word to continue'
     if state == 'paused':
@@ -209,9 +251,13 @@ def task_view(task, titles=None, merged=frozenset(), now=None):
     if state in ('blocked', 'failed') or any(d.get('verb') == 'blocked' for d in decisions):
         return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
     if state == 'done':
-        return 'DONE', SECTIONS[2], detail or 'Completed'
-    if state == 'working' and url:
-        return 'WORKING', SECTIONS[1], (detail or 'Worker running') + ('; PR checks green' if green else '; PR checks unknown')
+        action = detail.split(' | ')[0] or 'Completed'
+        if fields:
+            action += '; next: ' + fields['next'] + '; owner: ' + fields['owner']
+            if fields['next'] != 'nothing':
+                label = 'NEEDS ANSWER' if fields['next'] == 'captain-decision' else 'NEXT: ' + fields['next']
+                return label, SECTIONS[0], action
+        return 'DONE', SECTIONS[2], action
     if state == 'working':
         return ('CI RUNNING' if re.search(r'\bci (running|pending)\b', detail, re.I) else 'WORKING', SECTIONS[1], detail or 'Worker running')
     return 'BLOCKED', SECTIONS[0], 'Check worker state: ' + (detail or 'current state unavailable')
@@ -290,6 +336,11 @@ def project(snapshot, rules, homes=None):
             record.update(id=task['id'], project=task.get('project'))
             record.setdefault('title', task['id'])
             label, section, action = task_view(task, titles, merged, now)
+            related = (task.get('pr') or {}).get('related') or []
+            if related:
+                action += '; related PRs: ' + '; '.join(str(pr['url']) + ' ' + pr_checks(pr, now)[0] for pr in related)
+            if label in ('MERGED', 'CLOSED') or (label == 'DONE' and (task.get('current_state', {}).get('end_state') or task.get('paths', {}).get('status_log', {}).get('last_event', {}).get('end_state'))):
+                record.setdefault('completion', dict(date=now.date().isoformat()))
             endpoint = local_endpoint(task)
             if endpoint and sink is not None:
                 sink.append(dict(id=task['id'], target=endpoint, label=label))
@@ -311,13 +362,13 @@ def project(snapshot, rules, homes=None):
             owner_labels = collect(homes[owner['id']], owner['id'], None)
             incomplete = homes[owner['id']].get('main_inventory', {}).get('valid') is False
         else:
-            owner_labels, incomplete = summary_children(owner, add), summary_incomplete(owner)
+            owner_labels, incomplete = summary_children(owner, add, now), summary_incomplete(owner)
             if incomplete:
                 add(dict(id=owner['id'], title='Worker status'), 'CHECK', SECTIONS[0],
                     'Check worker: summary incomplete or unavailable')
         # A broad owner state cannot distinguish a question, merge, or designed
         # hold. Use the same child classifier as the board, including precedence.
-        priority = ('CI FAILED', 'BLOCKED', 'CHECKS UNKNOWN', 'CHECK', 'NEEDS ANSWER', 'READY:', 'REVIEW', 'HOLDING', 'WORKING', 'CI RUNNING', 'WAITING:', 'PAUSED')
+        priority = ('CI FAILED', 'PR FETCH FAILED', 'BLOCKED', 'CI RESPONSE', 'CI EVIDENCE', 'PR HEAD', 'CI NOT FETCHED', 'CHECK', 'NEEDS ANSWER', 'NEXT:', 'CI GREEN', 'no checks configured', 'REVIEW', 'HOLDING', 'WORKING', 'CI RUNNING', 'CI FETCHING', 'WAITING:', 'PAUSED', 'MERGED', 'CLOSED')
         label = next((value for prefix in priority for value in owner_labels if value.startswith(prefix)), 'DONE')
         if incomplete or label == 'CHECK':
             label = 'BLOCKED'
@@ -339,7 +390,7 @@ def summary_incomplete(owner):
                 or owner.get('current', {}).get('state') == 'unknown')
 
 
-def summary_children(owner, add):
+def summary_children(owner, add, now):
     """Rows from the parent's bounded summary, used only when the home cannot be read."""
     children, owner_labels = {}, []
     for surface in ('queued', 'holds', 'active_children', 'decisions_open', 'endpoints'):
@@ -362,13 +413,15 @@ def summary_children(owner, add):
         if endpoint or child.get('active') or child.get('held') or child['decisions']:
             current = endpoint or child.get('active') or child.get('held') or {}
             state = current.get('state') or ('parked' if child.get('held') else 'working')
-            task = dict(backlog=record, current_state=dict(state=state,
-                        detail=current.get('detail') or current.get('doing') or current.get('reason')),
-                        hints=dict(open_decisions=child['decisions']), pr=dict(url=record.get('pr_url')))
+            task = dict(backlog=record, current_state=dict(state=state, source=current.get('source'),
+                        end_state=current.get('end_state') or {}, detail=current.get('detail') or current.get('doing') or current.get('reason')),
+                        hints=dict(open_decisions=child['decisions']), pr=current.get('pr') or dict(url=record.get('pr_url')))
             label, section, action = task_view(task, child_titles)
         else:
             label, section, action = backlog_view(record)
         owner_labels.append(label)
+        if label in ('MERGED', 'CLOSED'):
+            record.setdefault('completion', dict(date=now.date().isoformat()))
         add(record, label, section, action, scope=owner['id'])
     return owner_labels
 
@@ -553,9 +606,9 @@ def style_of(row):
     if label == 'BLOCKED' and row['failed']:
         return 'peach', 'Failed', 'fail'
     for prefix, style in (('CI FAILED', ('peach', 'CI failed', 'fail')),
-                          ('CHECKS UNKNOWN', ('peach', 'Checks unknown', 'eye')),
-                          ('READY: apply', ('peach', 'Database, then merge', 'db')),
-                          ('READY:', ('green', 'Ready to merge', 'merge')),
+                          ('CI NOT FETCHED', ('peach', 'PR state not fetched', 'eye')),
+                          ('PR FETCH FAILED', ('peach', label, 'eye')),
+                          ('CI GREEN', ('green', 'CI green', 'merge')),
                           ('NEEDS ANSWER', ('yellow', 'Question for you', 'ask')),
                           ('REVIEW', ('yellow', 'Review the PR', 'eye')),
                           ('HOLDING', ('yellow', 'Waiting for your word', 'flag')),
@@ -569,13 +622,19 @@ def style_of(row):
 def step_state(row):
     label = row['label']
     if row['section'] in (SECTIONS[2], 'Completed prerequisites'):
-        return 'done', 'done'
+        return 'done', label if label in ('MERGED', 'CLOSED') else 'done'
+    if label.startswith(('CI GREEN', 'CI EVIDENCE', 'CI RESPONSE', 'PR HEAD')) or label == 'no checks configured':
+        return 'need', label
+    if label.startswith('PR FETCH FAILED'):
+        return 'fail', label
+    if label == 'CI FETCHING':
+        return 'run', label
     if label == 'WORKING' or label.startswith('CI RUNNING'):
-        return 'run', label.removeprefix('CI RUNNING: ') if label.startswith('CI RUNNING:') else 'checks running' if label == 'CI RUNNING' else 'running'
+        return 'run', label if label.startswith('CI RUNNING') else 'running'
     if label.startswith('CI FAILED'):
-        return 'fail', 'CI failed'
-    if label == 'CHECKS UNKNOWN':
-        return 'need', 'checks unknown'
+        return 'fail', label
+    if label == 'CI NOT FETCHED':
+        return 'need', 'PR state not fetched'
     if row['section'] == SECTIONS[0]:
         return ('fail', 'failed') if row['failed'] else ('need', 'stuck' if label in ('BLOCKED', 'CHECK') else 'needs you')
     if label == 'QUEUED':
@@ -764,7 +823,7 @@ def update_panes(home, labels):
 
 
 def fingerprint(home):
-    paths = [home / 'data/backlog.md', home / 'config/board-groups.json']
+    paths = [home / 'data/backlog.md', home / 'config/board-groups.json', home / 'state/board-pr-updated.json']
     for pattern in ('*.meta', '*.status', '*.busy*'):
         paths += sorted((home / 'state').glob(pattern))
     digest = hashlib.sha256()
@@ -806,6 +865,10 @@ def refresh(args, home):
                 if live:
                     task['pr'] = dict(recorded, **{k: live[k] for k in ('check_runs', 'merge_state', 'observed_at') if k in live},
                                       head_mismatch=bool(recorded.get('head') and recorded['head'] != live.get('head')))
+
+        if not args.snapshot and not args.pr_snapshot:
+            import fm_pr_state
+            fm_pr_state.enrich(home, [snapshot, *homes.values()])
 
         generated, full, labels, model = project(snapshot, rules, homes)
         write_board(home / 'data/board-full.md', full)

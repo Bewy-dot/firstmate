@@ -116,7 +116,7 @@ class Board(unittest.TestCase):
         self.assertIn('QUEUED DECISIONS', board)
         self.assertNotIn('Choose the legal option', board)
         self.assertIn('80 decisions', board)
-        self.assertIn('Recurring billing [READY: merge?] -> Fee schedule [WAITING', board)
+        self.assertIn('Recurring billing [CI GREEN] -> Fee schedule [WAITING', board)
         self.assertIn('Plan rollout [HOLDING]', board)
         self.assertIn('https://github.com/example/continuo/pull/101', board)
         self.assertIn('Choose the legal option 79', self.full())
@@ -194,7 +194,7 @@ class Board(unittest.TestCase):
                 endpoints=[dict(id='ready', title='Ready change', repo='isp', state='done',
                     detail='checks green', pr_url='https://github.com/example/isp/pull/42')])]))
         self.run_board()
-        self.assertIn('Ready change [CHECKS UNKNOWN]', self.board())
+        self.assertIn('Ready change [CI NOT FETCHED]', self.board())
         self.assertNotIn('Choose pilot', self.board())
         self.assertIn('Choose pilot [QUEUED]', self.full())
         self.assertEqual(self.full().count('Ready change ['), 1)
@@ -204,7 +204,7 @@ class Board(unittest.TestCase):
         ready = self.snap['tasks'][1]
         ready['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Awaiting your merge word')])
         self.run_board()
-        self.assertIn('Recurring billing [READY: merge?]', self.board())
+        self.assertIn('Recurring billing [CI GREEN]', self.board())
         ready['hints']['open_decisions'].append(dict(verb='needs-decision', summary='Which currency should invoices use?'))
         self.run_board()
         self.assertIn('Recurring billing [NEEDS ANSWER]', self.board())
@@ -268,7 +268,8 @@ class Board(unittest.TestCase):
         self.assertIn('\x1b[38;2;137;180;250m', raw)  # blue: running
         self.assertNotIn('243;139;168', raw)           # red is reserved for a failure
         self.assertIn('\ue0b2', raw)                  # powerline pill caps
-        self.assertIn('Database, then merge', text)
+        self.assertIn('CI green', text)
+        self.assertIn('production database change', text)
         self.assertIn('Question for you', text)
         self.assertIn('\x1b]8;;https://github.com/example/isp/pull/1\x1b\\', raw)
         self.assertIn('$ bin/fm-goto.sh', text)  # the selected worker shows its command
@@ -302,7 +303,7 @@ class Board(unittest.TestCase):
                          secondmate_landed=dict(records=[dict(id='q4', title='Queue Q4', repo='isp', owner='mate', pr_url=merged,
                                                               completion=dict(verb='merged', date='2026-10-29'))]))
         self.run_board()
-        self.assertIn('Queue dashboard [CHECKS UNKNOWN]', self.full())  # the bounded summary alone misreads it
+        self.assertIn('Queue dashboard [CI NOT FETCHED]', self.full())  # the bounded summary alone misreads it
         def codex(name, pr, event, note):
             return dict(id=name, kind='ship', project='isp', backend='herdr', endpoint=dict(target='lab:w3:p9', exists=True),
                         backlog=dict(id=name, title='Worker ' + name, repo='isp'), pr=dict(url=pr),
@@ -321,8 +322,8 @@ class Board(unittest.TestCase):
         self.assertNotIn('Worker status', full)
         self.assertNotIn('BLOCKED', board)
         needs = board.split('## NEEDS YOU NOW')[1].split('## Running')[0]
-        self.assertIn('Worker q6 [CHECKS UNKNOWN]', needs)
-        self.assertIn('Checks unknown', needs)
+        self.assertIn('Worker q6 [CI NOT FETCHED]', needs)
+        self.assertIn('PR checks not fetched (offline snapshot)', needs)
         self.assertIn(live, needs)
         self.assertNotIn(merged, board)  # a merged PR is never offered
         self.assertNotIn('switch', needs)  # a deliberate wait is not a request for you
@@ -342,7 +343,7 @@ class Board(unittest.TestCase):
                                                     completion=dict(verb='merged', date='2026-10-30'), pr_url=url))
         self.run_board()
         self.assertNotIn(url, self.board())
-        self.assertIn('Shipped work [DONE]', self.full())
+        self.assertIn('Shipped work [MERGED]', self.full())
 
     def test_registered_local_second_mate_home_is_read_from_disk(self):
         mate = self.home / 'mate'
@@ -551,7 +552,7 @@ class Board(unittest.TestCase):
                          '## Cadenza', '## ISP', '## AAA', '## MCA website', '## Firstmate', '## Other',
                          'Should allowances count toward compensation?',
                          'Apply the production database change, then give the merge word',
-                         'Give the merge word', 'Review the PR; checks unknown',
+                         'Give the merge word', 'Review the PR; PR checks not fetched (offline snapshot)',
                          'Resume after upstream version 2 is released', 'Login repair',
                          'https://github.com/example/cadenza/pull/9',
                          'https://github.com/example/isp/pull/1']:
@@ -595,7 +596,7 @@ class Board(unittest.TestCase):
                          hold_reason='Approve the pilot date')],
             endpoints=[dict(id='ready', repo='isp', title='Database release', state='done',
                             detail='checks green; apply production database migration before merge',
-                            pr_url='https://github.com/example/isp/pull/40')])])
+                            pr_url='https://github.com/example/isp/pull/40', pr=green_pr('https://github.com/example/isp/pull/40'))])])
         self.run_board()
         board = self.full()
         self.assertIn('Approve the revised liability cap', board.split('## Cadenza')[0])
@@ -618,13 +619,13 @@ class Board(unittest.TestCase):
         cases = [
             (dict(green_pr(url), check_runs=[
                 dict(name='tests', status='IN_PROGRESS', startedAt='2026-10-30T07:53:00Z'),
-                dict(name='lint', state='PENDING')]), 'CI RUNNING: 2 pending, 7m elapsed'),
+                dict(name='lint', state='PENDING')]), 'CI RUNNING: 0 of 2 checks passed, 7m elapsed'),
             (dict(green_pr(url), check_runs=[dict(name='lint', status='COMPLETED', conclusion='FAILURE')]), 'CI FAILED: lint'),
-            (green_pr(url), 'READY: apply + merge?'),
-            (dict(url=url), 'CHECKS UNKNOWN'),
-            (dict(green_pr(url), merge_state='BLOCKED'), 'CHECKS UNKNOWN'),
-            (dict(green_pr(url), check_runs=[]), 'CHECKS UNKNOWN'),
-            (dict(green_pr(url), observed_at='2026-10-30T07:00:00Z'), 'CHECKS UNKNOWN')]
+            (green_pr(url), 'CI GREEN'),
+            (dict(url=url), 'CI NOT FETCHED'),
+            (dict(green_pr(url), merge_state='BLOCKED'), 'CI GREEN'),
+            (dict(green_pr(url), check_runs=[]), 'no checks configured'),
+            (dict(green_pr(url), observed_at='2026-10-30T07:00:00Z'), 'CI EVIDENCE EXPIRED')]
         for pr, label in cases:
             with self.subTest(label=label, pr=pr):
                 base['pr'] = pr
@@ -637,11 +638,11 @@ class Board(unittest.TestCase):
         base['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Please review the PR')])
         base['pr'] = cases[0][0]
         self.run_board()
-        self.assertIn('CI RUNNING: 2 pending', self.full())
+        self.assertIn('CI RUNNING: 0 of 2 checks passed', self.full())
         self.assertNotIn('Review the PR', self.full())
         base['pr'] = dict(url=url)
         self.run_board()
-        self.assertIn('Review the PR; checks unknown', self.full())
+        self.assertIn('Review the PR; PR checks not fetched (offline snapshot)', self.full())
 
     def test_offline_pr_enrichment_matches_url_and_head(self):
         url = 'https://github.com/example/isp/pull/1'
@@ -653,12 +654,51 @@ class Board(unittest.TestCase):
         self.path.write_text(json.dumps(self.snap))
         cmd = [str(ROOT / 'bin/fm-board.sh'), 'render', '--snapshot', str(self.path), '--pr-snapshot', str(evidence)]
         subprocess.run(cmd, env=self.env, check=True, capture_output=True)
-        self.assertIn('READY: apply + merge?', self.full())
+        self.assertIn('CI GREEN', self.full())
         task['pr']['head'] = 'new-commit'
         self.path.write_text(json.dumps(self.snap))
         subprocess.run(cmd, env=self.env, check=True, capture_output=True)
-        self.assertIn('CHECKS UNKNOWN', self.full())
-        self.assertNotIn('READY:', self.full())
+        self.assertIn('PR HEAD CHANGED', self.full())
+        self.assertNotIn('CI GREEN', self.full())
+
+    def test_structured_status_evidence_and_live_disagreement(self):
+        task = self.snap['tasks'][3]
+        task['pr'] = dict(url='https://github.com/example/isp/pull/1')
+        fields = dict(pr=task['pr']['url'], checks='green', next='review', owner='captain')
+        task['current_state'] = dict(state='done', source='status-log', detail='Implemented invoice history')
+        task['paths'] = dict(status_log=dict(last_event=dict(state='done', end_state=fields)))
+        self.snap['tasks'] = [task]
+        self.run_board()
+        self.assertIn('CI GREEN', self.full())
+        self.assertIn('worker reported; confirming', self.full())
+        self.assertIn('Review the PR', self.full())
+        self.assertIn('owner: captain', self.full())
+        task['pr']['url'] = 'https://github.com/example/isp/pull/2'
+        self.run_board()
+        self.assertNotIn('CI GREEN', self.full())  # evidence belongs to an exact URL
+        task['pr']['url'] = fields['pr']
+        task['pr'].update(green_pr(fields['pr']))
+        task['pr']['check_runs'] = [dict(name='integration', state='FAILURE')]
+        self.run_board()
+        self.assertIn('CI FAILED: integration', self.full())
+        self.assertIn('next: review; owner: captain', self.full())
+        self.assertNotIn('CI GREEN', self.full())
+        # A current busy source does not inherit an earlier worker's green report.
+        task['pr'] = dict(url=fields['pr'])
+        task['current_state'] = dict(state='working', source='pane', detail='Implementing more work')
+        self.run_board()
+        self.assertNotIn('CI GREEN', self.full())
+        task['pr'].update(green_pr(fields['pr']))
+        self.run_board()
+        self.assertIn('Implementing more work; All required checks passed', self.full())
+        self.assertNotIn('Give the merge word', self.full())
+        # Local-only commits name the pending action rather than disappearing as done.
+        task['pr'] = {}
+        fields.update(pr='none', checks='none', next='merge', owner='firstmate')
+        task['current_state'] = dict(state='done', source='status-log', detail='Committed parser repair')
+        self.run_board()
+        self.assertIn('NEXT: merge', self.full())
+        self.assertIn('owner: firstmate', self.full())
 
     def test_real_canonical_snapshot_backlog(self):
         (self.home / 'data').mkdir()

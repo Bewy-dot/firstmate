@@ -10,7 +10,7 @@ command -v herdr >/dev/null || { echo 'skip: herdr not installed'; exit 0; }
 original_path=$PATH
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-board-e2e.XXXXXX")
 HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
-HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-board-tab-sections)
+HERDR_LAB_SESSION=${HERDR_LAB_SESSION:-$("$HERDR_LAB_HELPER" name fm-board-tab-sections)}
 cleanup() {
   local rc=$?
   trap - EXIT
@@ -176,28 +176,28 @@ for state, detail, expected, backlog in [
     ('working', 'Implementing', 'WORKING', {}), ('working', 'ci running', 'CI RUNNING', {}),
     ('working', 'Implementing', 'WAITING: Earlier step',
      dict(unresolved_blocker_ids=['earlier'])),
-    ('done', 'checks green', 'READY: merge?',
+    ('done', 'checks green', 'CI GREEN',
      dict(captain_actionable=True, hold_kind='captain', hold_reason='Merge this')),
-    ('done', 'checks green; apply production database migration before merge', 'READY: apply + merge?', {}),
+    ('done', 'checks green; apply production database migration before merge', 'CI GREEN', {}),
     ('blocked', 'Waiting for captain word', 'HOLDING',
      dict(hold_kind='captain', hold_reason='Wait for the captain word')),
     ('paused', 'Resume after upstream release', 'PAUSED', {}),
     ('blocked', 'Need credentials', 'BLOCKED', {}),
     ('done', 'Report completed', 'DONE', {})]:
-    t['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Awaiting your merge word')]) if expected == 'READY: merge?' else {}
+    t['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Awaiting your merge word')]) if expected == 'CI GREEN' else {}
     t['backlog'] = dict(id=t['id'], title='Test work', repo='continuo', **backlog)
     s['backlog']['records'] = [dict(id='earlier', title='Earlier step', structured=True, repo='continuo', state='in_flight')]
     t['current_state'] = dict(state=state, detail=detail)
     t['pr'] = dict(url='https://github.com/example/continuo/pull/1',
                    observed_at=s['generated'], merge_state='CLEAN',
-                   check_runs=[dict(name='tests', status='COMPLETED', conclusion='SUCCESS')]) if expected.startswith('READY:') else {}
+                   check_runs=[dict(name='tests', status='COMPLETED', conclusion='SUCCESS')]) if expected == 'CI GREEN' else {}
     p.write_text(json.dumps(s))
     refresh_label(t['id'] + ' - ' + expected)
 for runs, expected in [
     ([dict(name='tests', status='IN_PROGRESS', startedAt='2026-10-30T07:53:00Z'),
-      dict(name='lint', state='PENDING')], 'CI RUNNING: 2 pending, 7m elapsed'),
+      dict(name='lint', state='PENDING')], 'CI RUNNING: 0 of 2 checks passed, 7m elapsed'),
     ([dict(name='lint', status='COMPLETED', conclusion='FAILURE')], 'CI FAILED: lint'),
-    ([], 'CHECKS UNKNOWN')]:
+    ([], 'no checks configured')]:
     t['hints'] = {}
     t['backlog'] = dict(id=t['id'], title='CI test', repo='continuo')
     t['current_state'] = dict(state='done', detail='PR opened')
@@ -210,7 +210,7 @@ s['tasks'] = [dict(id='mate', kind='secondmate', backend='herdr',
                    endpoint=dict(target=session + ':' + pane, exists=True))]
 for state, detail, backlog, expected in [
     ('working', 'Implementing', dict(unresolved_blocker_ids=['earlier']), 'WAITING: Earlier step'),
-    ('done', 'checks green', dict(hold_kind='captain', captain_actionable=True), 'CHECKS UNKNOWN'),
+    ('done', 'checks green', dict(hold_kind='captain', captain_actionable=True), 'CI NOT FETCHED'),
     ('blocked', 'Wait for captain word', dict(hold_kind='captain', hold_reason='Wait for captain word'), 'HOLDING')]:
     s['secondmate_current'] = dict(records=[dict(id='mate',
         current=dict(state='active_child_work' if state == 'working' else 'captain_decision'),
@@ -219,6 +219,19 @@ for state, detail, backlog, expected in [
                 dict(id='earlier', repo='continuo', title='Earlier step')],
         endpoints=[dict(id='child', state=state, detail=detail,
                         pr_url='https://github.com/example/continuo/pull/1')])])
+    p.write_text(json.dumps(s))
+    refresh_label('mate - ' + expected)
+# New cold-cache and failed-fetch states must never aggregate to DONE.
+for evidence, expected in [
+    (dict(pending_fetch=True), 'CI FETCHING'),
+    (dict(live=True, error='GitHub unreachable'), 'PR FETCH FAILED: GitHub unreachable'),
+    (dict(live=True, state='MERGED'), 'MERGED'),
+    (dict(live=True, state='CLOSED'), 'CLOSED')]:
+    owner = s['secondmate_current']['records'][0]
+    owner['queued'] = []
+    owner['endpoints'] = [dict(id='child', state='done', detail='PR opened',
+        pr_url='https://github.com/example/continuo/pull/1',
+        pr=dict(url='https://github.com/example/continuo/pull/1', **evidence))]
     p.write_text(json.dumps(s))
     refresh_label('mate - ' + expected)
 

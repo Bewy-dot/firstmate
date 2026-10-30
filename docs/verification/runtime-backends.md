@@ -212,13 +212,15 @@ Observed output:
 
 ```text
 Herdr 0.9.5 / protocol 22
-ok - real Herdr: labels, rendered board, adjacent placement, reuse, and closed-pane recovery
+section keys: Tab forward/wrap, CSI Z backward, 1-4 jumps, restart retains Parked
+ok - real Herdr: labels, rendered board, adjacent placement, reuse, closed-pane recovery, go-to-pane focus, and section keys
 ```
 
 The test includes a PATH longer than the canonical terminal input limit, checks mode 0700 on the generated viewer script, and waits for a real shell prompt before launch.
-The worker and second mate pane cases include waiting on an earlier task, a green PR with a generic approval flag, and a deliberate captain hold reported as blocked.
+The worker and second mate pane cases include waiting on an earlier task, `CI GREEN` from recorded check evidence, `CI RUNNING` with passed/total counts and elapsed time, named failures, no configured checks, offline missing evidence, and a deliberate captain hold reported as blocked.
 `bash tests/fm-board.test.sh` additionally exercises the compact/full files, dependency grouping, filed decisions, note preservation, and the terminal scrollbar and detail toggle through a real pseudo-terminal.
-Its teardown verifies that the live default session is unchanged.
+The fake-forge cases also cover bounded asynchronous refresh, cache reuse and expiry, GitLab pagination, fetch failure reasons, timeouts, structured terminal parsing, and current forge evidence overriding worker reports.
+The real Herdr test teardown verifies that the live default session is unchanged.
 This test covers presentation and shell startup, independently of worker harness choice; canonical fleet state remains owned by `bin/fm-fleet-snapshot.sh`.
 
 ### Prune and respawn
