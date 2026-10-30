@@ -629,7 +629,7 @@ notify_from_status() {  # <task-id> <status-line>
   case "$verb" in
     done)
       if notify_note_is_pr "$note"; then
-        class=pr-ready
+        class='pr-ready'
         title='firstmate: PR ready for review'
       else
         class=attention

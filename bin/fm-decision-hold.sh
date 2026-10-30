@@ -20,10 +20,18 @@
 #   fm-decision-hold.sh id <origin-id> <decision-key>
 #   fm-decision-hold.sh hold <origin-id> <decision-key> \
 #     --title <title> --reason <reason> [--repo <repo>]
+#   fm-decision-hold.sh ask <hold-id>... [--question <one-line-question>]
 #   fm-decision-hold.sh complete <origin-id> (--none | <decision-key>...)
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
+#
+# `ask` verifies every named active captain hold before recording presentation
+# state in data/decision-asked.json: {"<hold-id>": {"asked_at": "UTC ISO time",
+# "question": "optional one-line question"}}. Retries preserve the first asked_at
+# and only change the question when --question is supplied. Ask and resolve
+# serialize on data/.decision-asked.lock; resolve clears the marker only after
+# successful closure (including a verified exact retry). No origin meta is needed.
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # `--none` is an explicit semantic attestation that the just-reviewed surface has
@@ -274,6 +282,70 @@ command_hold() {
   printf '%s\n' "$id"
 }
 
+lock_asked() {
+  # shellcheck source=bin/fm-wake-lib.sh
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/fm-wake-lib.sh"
+  mkdir -p "$DATA"
+  FM_DECISION_ASK_LOCK="$DATA/.decision-asked.lock"
+  fm_lock_acquire_wait "$FM_DECISION_ASK_LOCK"
+  trap 'fm_lock_release "$FM_DECISION_ASK_LOCK"' EXIT
+}
+
+write_asked() {  # <ask|clear> <question-or-empty> <hold-id>...
+  python3 - "$DATA/decision-asked.json" "$@" <<'PYASK'
+import datetime, json, os, pathlib, sys, tempfile
+path = pathlib.Path(sys.argv[1])
+mode, question, *ids = sys.argv[2:]
+records = json.loads(path.read_text()) if path.exists() else {}
+if not isinstance(records, dict):
+    raise ValueError('decision-asked.json must contain an object')
+before = dict(records)
+for identity in ids:
+    if mode == 'clear':
+        records.pop(identity, None)
+    else:
+        record = dict(records.get(identity) or {})
+        record.setdefault('asked_at', datetime.datetime.now(datetime.timezone.utc).isoformat())
+        if question:
+            record['question'] = question
+        records[identity] = record
+if records != before:
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as out:
+        temporary = pathlib.Path(out.name)
+        json.dump(records, out, indent=2)
+        out.write('\n')
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+PYASK
+}
+
+command_ask() {
+  local question='' ids='' id
+  [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --question)
+        shift
+        question=${1:-}
+        validate_one_line question "$question"
+        ;;
+      --*) usage >&2; exit 2 ;;
+      *) validate_slug hold-id "$1"; ids="${ids}${ids:+ }$1" ;;
+    esac
+    shift
+  done
+  [ -n "$ids" ] || fail 'ask requires at least one hold id'
+  require_tasks_axi
+  lock_asked
+  for id in $ids; do verify_hold_active "$id"; done
+  # shellcheck disable=SC2086 # Validated slug list, never shell input.
+  write_asked ask "$question" $ids
+  printf 'asked: %s\n' "$ids"
+}
+
 command_complete() {
   local origin=${1:-} meta previous='' supplied='' keys='' key status_file open raw_open key_seen=0 has_meta=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
@@ -368,6 +440,7 @@ EOF
 }
 
 command_resolve() {
+  lock_asked
   local origin=${1:-} key=${2:-} decision_file='' id='' decision='' decision_digest='' body='' routed='' routed_csv='' dep show blocked state hold_show hold_body resolution_recorded=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
@@ -397,6 +470,7 @@ command_resolve() {
     hold_show=$(task_show "$id")
     hold_body=$(show_field "$hold_show" body)
     verify_resolution_identity "$id" "$hold_body" "$decision_digest" "$routed_csv"
+    write_asked clear '' "$id"
     printf 'resolved: %s\n' "$id"
     return 0
   fi
@@ -450,12 +524,14 @@ command_resolve() {
   done
   tasks_axi "done" "$id" >/dev/null || fail "could not close resolved captain hold $id"
   verify_hold_resolved "$id" || fail "captain hold $id did not retain its durable resolution record"
+  write_asked clear '' "$id"
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
 
 case "${1:-}" in
   id) shift; command_id "$@" ;;
   hold) shift; command_hold "$@" ;;
+  ask) shift; command_ask "$@" ;;
   complete) shift; command_complete "$@" ;;
   verify) shift; command_verify "$@" ;;
   resolve) shift; command_resolve "$@" ;;

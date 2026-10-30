@@ -770,7 +770,9 @@ fi
 while :; do
   # Presentation is independent of wake delivery. Its non-blocking lock and
   # content fingerprint collapse retries, and non-Herdr backends no-op.
-  FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
+  if [ "${FM_BOARD_DISABLED:-0}" != 1 ]; then
+    FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
+  fi
   # Self-eviction: if the singleton lock no longer names this process, a second
   # watcher has taken over (e.g. a transient duplicate from a racy arm). Stand
   # down so the rightful singleton continues alone. The EXIT trap's release
@@ -882,6 +884,10 @@ while :; do
   # signature for an already-pending file (last write wins below).
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
+    # Publish at signal detection, before grace, wake triage, or delivery exits.
+    if [ "${FM_BOARD_DISABLED:-0}" != 1 ]; then
+      FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
+    fi
     sleep "$SIGNAL_GRACE"
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""

@@ -560,3 +560,43 @@ test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home
 test_resolve_matches_quoted_blocked_by_edges
+
+
+test_asked_marker_and_board_lifecycle() {
+  local home first second stamp before question
+  home=$(make_home asked-board)
+  mkdir -p "$home/data/sample"
+  printf '# Sample review\n' > "$home/data/sample/report.md"
+  first=$(run_decisions "$home" hold sample route --title 'Choose route' --reason 'Choose a route' --repo sample) || fail 'first hold failed'
+  second=$(run_decisions "$home" hold sample access --title 'Choose access' --reason 'Choose access' --repo sample) || fail 'second hold failed'
+  FM_HOME="$home" FM_BOARD_DISABLED=0 "$ROOT/bin/fm-board.sh" render >/dev/null || fail 'unasked warm render failed'
+  jq -e '.counts.need == 0 and .counts.queued == 2' "$home/state/board-model.json" >/dev/null || fail 'unasked holds were not queued'
+  run_decisions "$home" ask "$first" "$second" --question 'North or south?' >/dev/null || fail 'ask failed'
+  stamp=$(jq -r --arg id "$first" '.[$id].asked_at' "$home/data/decision-asked.json")
+  before=$(shasum -a 256 "$home/data/decision-asked.json")
+  run_decisions "$home" ask "$first" "$second" --question 'North or south?' >/dev/null || fail 'ask retry failed'
+  [ "$before" = "$(shasum -a 256 "$home/data/decision-asked.json")" ] || fail 'identical ask changed durable record'
+  run_decisions "$home" ask "$first" --question 'East or west?' >/dev/null || fail 'question update failed'
+  [ "$stamp" = "$(jq -r --arg id "$first" '.[$id].asked_at' "$home/data/decision-asked.json")" ] || fail 'question update reset asked time'
+  before=$(shasum -a 256 "$home/data/decision-asked.json")
+  if run_decisions "$home" ask "$first" missing >/dev/null 2>&1; then fail 'missing hold accepted'; fi
+  [ "$before" = "$(shasum -a 256 "$home/data/decision-asked.json")" ] || fail 'partial ask changed records'
+  question=$'bad\nquestion'
+  if run_decisions "$home" ask "$first" --question "$question" >/dev/null 2>&1; then fail 'multiline question accepted'; fi
+  FM_HOME="$home" FM_BOARD_DISABLED=0 "$ROOT/bin/fm-board.sh" render >/dev/null || fail 'asked board render failed'
+  jq -e '.counts.need == 2 and .counts.queued == 0 and any(.need[]; .action | contains("East or west?") and contains("Waiting"))' "$home/state/board-model.json" >/dev/null || fail 'asked holds missing from Needs'
+  printf 'Choose west.\n' > "$home/answer.txt"
+  tasks_in "$home" add routed 'Implement chosen route' --repo sample >/dev/null || fail 'routed task failed'
+  tasks_in "$home" block routed --by "$first" >/dev/null || fail 'routed edge failed'
+  if run_decisions "$home" resolve sample route --decision-file "$home/answer.txt" --routed-to missing >/dev/null 2>&1; then fail 'invalid route accepted'; fi
+  jq -e --arg id "$first" 'has($id)' "$home/data/decision-asked.json" >/dev/null || fail 'failed resolution cleared asked marker'
+  run_decisions "$home" resolve sample route --decision-file "$home/answer.txt" --routed-to routed >/dev/null || fail 'resolve failed'
+  jq -e --arg id "$first" --arg other "$second" '(has($id) | not) and has($other)' "$home/data/decision-asked.json" >/dev/null || fail 'resolve did not clear only the resolved marker'
+  run_decisions "$home" resolve sample route --decision-file "$home/answer.txt" --routed-to routed >/dev/null || fail 'resolve retry failed'
+  if run_decisions "$home" ask "$first" >/dev/null 2>&1; then fail 'closed hold asked again'; fi
+  FM_HOME="$home" FM_BOARD_DISABLED=0 "$ROOT/bin/fm-board.sh" render >/dev/null || fail 'resolved board render failed'
+  jq -e '.counts.need == 1 and .counts.queued == 0' "$home/state/board-model.json" >/dev/null || fail 'resolved question remained in Needs'
+  pass 'asked holds retain question and first timestamp, surface on the board, and clear only after successful resolution'
+}
+
+test_asked_marker_and_board_lifecycle

@@ -799,6 +799,23 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+test_incremental_task_json_matches_canonical_row() {
+  local home fakebin full task
+  home=$(make_home incremental-task)
+  write_fixture "$home"
+  fakebin=$(make_fakebin "$home")
+  full=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-10-30T08:00:00Z "$SNAPSHOT" --json)
+  task=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-10-30T08:00:00Z "$SNAPSHOT" --task-json scout-task)
+  jq -ne --argjson full "$full" --argjson task "$task" '
+    ($full.tasks | map(select(.id == "scout-task")) | map(del(.backlog))) == $task
+    and ($task | length) == 1
+  ' >/dev/null || fail 'incremental task read differs from canonical task state'
+  PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --task-json missing | jq -e 'length == 0' >/dev/null \
+    || fail 'absent incremental worker must remain absent'
+  FM_HOME="$home" "$SNAPSHOT" --task-json ../invalid >/dev/null 2>&1 && fail 'invalid task id accepted'
+  pass 'incremental task JSON shares canonical state and validates the task id'
+}
+
 test_structured_terminal_fields
 test_empty_fleet_json
 test_fixture_snapshot_json
@@ -815,3 +832,5 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+
+test_incremental_task_json_matches_canonical_row

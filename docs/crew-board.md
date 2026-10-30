@@ -4,8 +4,11 @@ Firstmate keeps a terminal board in a persistent pane beside firstmate in Herdr,
 The board is a presentation of the canonical fleet snapshot used by bearings, including structured backlog decisions and each local second mate's own home snapshot.
 It reads cached forge evidence without waiting for network requests and does not authorize an action or change task state.
 
-The existing supervision loop and status-surfacing path refresh the presentation automatically.
-The board viewer also checks for changes between supervision cycles, with a 30-second backstop for CI or secondmate state that changes without a local status event.
+The watcher refreshes the presentation when it detects a status append or turn-end marker, before wake triage or delivery.
+The viewer also requests refreshes independently, so no chat message is needed.
+Warm status and healthy forge-check updates normally reach the viewer within about ten seconds; slow or unavailable providers remain visibly cached or failed.
+Expensive fleet collection runs separately from publishing the board, while changed workers are re-read through the canonical snapshot producer.
+A refresh that finds publication busy queues one follow-up that reads the latest inputs after the active writer finishes.
 Run `bin/fm-board.sh refresh` from the firstmate pane to initialize or restore it immediately.
 Pane operations safely do nothing on other backends; `bin/fm-board.sh render` can still generate the Markdown file there.
 The viewer needs only Python 3 and its standard library, with no third-party package to install.
@@ -20,6 +23,8 @@ Each live local Herdr worker pane has its task id followed by a state label.
 `REVIEW` means an open worker question explicitly asks you to review the PR.
 An opened PR or a merge request never implies a review request.
 `CI RUNNING` shows how many required checks have passed out of the total, plus elapsed time since the earliest check started when the forge supplies a start time.
+`CI RUNNING (restarted after fix)` marks checks that resumed after the item needed attention, with elapsed time since the board observed the restart.
+The narrow terminal summary abbreviates this to `CI restarted` plus elapsed time.
 `CI FAILED` names the failing checks.
 `CI GREEN` means all required checks passed; the action text separately names review, merge, or a production step.
 `MERGED` and `CLOSED` identify terminal PR states, and `no checks configured` means the forge reports no required checks.
@@ -27,11 +32,14 @@ An opened PR never by itself grants merge approval.
 
 Normal renders schedule background reads through GitHub's JSON-capable `gh` interface or the existing `glab` path for GitLab, including self-hosted instances.
 `gh-axi` remains the operator interface; its formatted PR commands do not expose the required machine-readable check fields.
-The PR evidence cache under `state/` is reused for about 60 seconds, including failures.
+Open PR evidence is refreshed frequently; fetch failures back off and terminal PRs are checked less often.
+The exact retry intervals belong to `bin/fm_pr_state.py`.
 Rendering uses stale evidence immediately and marks it as cached while refreshing; the viewer never waits on a forge request.
 A cold cache shows `CI FETCHING` until the background request finishes.
 The refresh worker limits concurrent requests and imposes a short timeout on each CLI process group; exact cache layout and limits belong to `bin/fm_pr_state.py`.
-Completed refreshes invalidate the board fingerprint so the next viewer cycle uses them.
+Completed forge reads request a fresh projection immediately.
+The fingerprint covers status logs, turn-end markers, task metadata, local child-home inputs, and PR cache files.
+The viewer watches both the model and Markdown modification times and redraws changed screen rows promptly.
 Fetch failures name the reason, such as GitHub unreachable, no permission, PR not found, missing CLI, or request timed out.
 A GitHub 404 cannot distinguish a missing PR from a private PR hidden by permissions, so that ambiguity is stated explicitly.
 Every recorded task PR and historical status-log PR reference is refreshed, with related PR states in the full action text.
@@ -58,10 +66,17 @@ It shows overall counts, up to five groups needing you now, and up to four group
 Long titles and action summaries are shortened, and overflow is counted rather than listed.
 `data/board-full.md`, linked from the summary, contains every projected item with its full title, action, task reference, prerequisite references, and full HTTPS PR URLs.
 Both files use the same canonical snapshot and local group mapping.
+A one-line `Just moved` strip retains the five latest section transitions for five minutes, including why an item left Needs you.
+The terminal strip shows compact transitions, starting with the latest and rotating recent moves; both Markdown files retain the full reasons.
+Movement history survives viewer restarts in the presentation model and never changes task state.
 Second mate summaries remain bounded by the snapshot producer; incomplete or omitted records are disclosed rather than described as complete.
 
 `NEEDS YOU NOW` means a current worker question, deliberate wait for your word, PR review or merge request, or a worker failure requiring intervention.
-`QUEUED DECISIONS` counts filed decisions by programme; backlog eligibility alone never means the question has been asked.
+`QUEUED DECISIONS` counts only unasked filed decisions by programme; backlog eligibility alone never means the question has been asked.
+An asked decision appears in `NEEDS YOU NOW` with its one-line question and waiting age.
+Use the decision lifecycle command to mark a question when it is actually put to the captain; [decision hold mechanics](decision-hold-lifecycle.md) describes its ownership.
+Structured requests for a captain answer or production application also stay in Needs you, including second mate confirmations.
+A merge request with restarted checks remains in motion until those checks finish, with the movement reason retained above.
 `PARKED` counts deferred work with its bring-back trigger in the full detail file.
 A worker's declared external wait also belongs there.
 Completed entries stay in the full detail file for the current UTC date and preceding two dates; older prerequisites remain as chain context.
@@ -73,6 +88,8 @@ Dependency groups use existing backlog prerequisite ids within each operational 
 Linked programme records supply programme names; otherwise counts use the project and its configured category.
 Linear sequences show each step's state in prerequisite order and what must happen before the sequence continues.
 Branches name their prerequisites explicitly rather than implying a sequence between siblings.
+Queued implementation steps with unresolved prerequisites appear as waiting in the chain, including multi-parent branches.
+The In motion Tab view and full view show prerequisite names on separate lines so long titles cannot hide the edges.
 Missing prerequisites and dependency cycles remain visible.
 The compact summary shows one PR URL per group and counts any additional PRs in the full detail file.
 
@@ -86,7 +103,9 @@ Yellow and peach mean the item needs you, green means ready to merge or done, bl
 Mauve marks links and the selected item, and peach also marks a failure with an explicit Failed label.
 Every state also has a word and an icon, so colour is never the only signal.
 
-The default view shows up to five items that need you, with the selected one expanded to its question, links, and pane location.
+The default Needs list uses at most eight content lines, followed by `+n more, press 1`.
+Press `1` for every question, waiting age, links, and the selected worker location.
+Titles remain clickable in the compact view.
 Below them, each group in motion is one line with its dependency chain drawn as connected icons, then three summary lines for queued decisions, parked work, and recent completions.
 `f` switches to the full view, where every item is expanded and every chain is drawn as a vertical rail with dashed connectors for waiting steps.
 
@@ -100,8 +119,8 @@ Keys:
 - `b` opens the brief, and `r` opens the report.
 - Tab cycles Needs you now, In motion, Queued, and Parked; Shift-Tab goes back, and `1` to `4` jump directly.
 - The active header pill has a `>` marker, and the last section is remembered across viewer restarts in the same terminal session.
-- In motion lists selectable dependency steps with their state and pane location; Queued lists filed decisions and their age by programme, and Parked shows each bring-back trigger.
-- Queued means filed and not yet asked; nobody is blocked by a queued decision.
+- In motion lists selectable dependency steps with their state and pane location, including chains with no running worker; Queued lists unasked filed decisions and their age by programme, and Parked shows each bring-back trigger.
+- Queued means filed and not yet asked; a queued step can still block dependent work, and its unresolved prerequisites remain visible.
 - Enter on a queued decision or parked item opens its detail file; `b` and `r` open its brief and report when present.
 - `f` switches between the summary and the full view, and `q` exits.
 

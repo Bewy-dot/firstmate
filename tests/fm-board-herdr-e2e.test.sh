@@ -122,7 +122,7 @@ fi
 lab pane send-keys "$keys_pane" tab
 wait_key_frame 'In motion'
 lab pane send-keys "$keys_pane" tab
-wait_key_frame 'Nobody is blocked'
+wait_key_frame 'Dependencies may wait'
 if [ -n "${FM_BOARD_EVIDENCE_DIR:-}" ]; then
   lab pane read "$keys_pane" --source visible --format ansi --raw > "$FM_BOARD_EVIDENCE_DIR/after-queued.ansi"
 fi
@@ -141,7 +141,7 @@ for section in 1 2 3 4; do
        if [ -n "${FM_BOARD_EVIDENCE_DIR:-}" ]; then
          lab pane read "$keys_pane" --source visible --format ansi --raw > "$FM_BOARD_EVIDENCE_DIR/after-moving.ansi"
        fi ;;
-    3) wait_key_frame 'Nobody is blocked' ;;
+    3) wait_key_frame 'Dependencies may wait' ;;
     4) wait_key_frame 'Bring back:' ;;
   esac
 done
@@ -236,6 +236,88 @@ for evidence, expected in [
     refresh_label('mate - ' + expected)
 
 PY
+# The real viewer must observe file/forge events without any supervisor/chat turn.
+printf '%s\n' 'latency proof: creating isolated viewer workspace'
+latency_parent=$(lab workspace create --label board-latency | jq -r '.result.root_pane.pane_id')
+lab pane wait-output "$latency_parent" --regex '[#$%>❯➜][ \t]*$' --lines 8 --timeout 10000 >/dev/null
+HERDR_PANE_ID="$latency_parent" python3 - "$ROOT" "$TMP_ROOT" "$worker" "$workspace" <<'PYLATENCY'
+import hashlib, json, os, pathlib, subprocess, sys, time
+root, tmp, worker, workspace = sys.argv[1:]
+home = pathlib.Path(tmp) / 'latency-home'
+for folder in ('state', 'data', 'config'):
+    (home / folder).mkdir(parents=True, exist_ok=True)
+(home / 'data/backlog.md').write_text('## In flight\n\n## Queued\n\n## Done\n')
+session = os.environ['HERDR_SESSION']
+url = 'https://github.com/example/cadenza/pull/1'
+(home / 'state/latency.meta').write_text(f'kind=scout\nharness=codex\nbackend=herdr\nwindow={session}:{worker}\nherdr_session={session}\nherdr_workspace_id={workspace}\nherdr_pane_id={worker}\nworktree={home}\nproject=cadenza\npr={url}\n')
+status = home / 'state/latency.status'
+status.write_text('working: Implementing\n')
+# Only the forge is fake; the viewer, canonical producer, adapter, panes and
+# guarded transport are real. Worker status reports are the controlled input.
+fakebin = pathlib.Path(tmp) / 'latency-bin'
+fakebin.mkdir()
+forge = home / 'forge-state'
+forge.write_text('SUCCESS')
+cli = fakebin / 'gh'
+cli.write_text('#!/usr/bin/env python3\nimport json,pathlib,sys\nstate=pathlib.Path(' + repr(str(forge)) + ').read_text()\nif sys.argv[2]=="view": print(json.dumps(dict(state="OPEN",headRefOid="a")))\nelse: print(json.dumps([dict(name="test",state=state,bucket="pending" if state=="IN_PROGRESS" else "pass")]))\n')
+cli.chmod(0o700)
+env = dict(os.environ, FM_HOME=str(home), PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
+# Seed a healthy cache so initialization measures the canonical collection only.
+cache = home / 'state/board-pr-cache'
+cache.mkdir()
+(cache / (hashlib.sha256(url.encode()).hexdigest() + '.json')).write_text(json.dumps(dict(url=url, live=True, state='OPEN', fetched_at=time.time(), check_runs=[dict(name='test', state='SUCCESS')])))
+start = time.monotonic()
+subprocess.run([root + '/bin/fm-board.sh', 'refresh'], env=env, check=True)
+print(f'cold canonical collection + pane setup: {time.monotonic()-start:.3f}s', flush=True)
+def lab(*args):
+    return subprocess.check_output(['herdr', *args, '--session', session], text=True)
+label = 'Firstmate board ' + hashlib.sha256(str(home.resolve()).encode()).hexdigest()[:12]
+pane = next(p['pane_id'] for p in json.loads(lab('pane', 'list'))['result']['panes'] if p.get('label') == label)
+def wait_visible(needle, start, budget=10):
+    text = ''
+    while time.monotonic() - start < budget:
+        text = lab('pane', 'read', pane, '--source', 'visible', '--lines', '80')
+        if needle in text:
+            return time.monotonic() - start
+        time.sleep(.1)
+    raise AssertionError(f'{needle} not visible within {budget}s:\n{text}')
+wait_visible('In motion', time.monotonic())
+start = time.monotonic()
+with status.open('a') as out:
+    out.write(f'done: Implemented | pr={url} | checks=green | next=merge | owner=captain\n')
+status_latency = wait_visible('CI green', start)
+print(f'status append -> real viewer: {status_latency:.3f}s (budget 10s)', flush=True)
+start = time.monotonic()
+forge.write_text('IN_PROGRESS')
+ci_latency = wait_visible('CI restarted', start)
+model = json.loads((home / 'state/board-model.json').read_text())
+assert model['counts']['need'] == 0 and model['counts']['moving'] == 1, model
+assert 'moved from Needs you to Running' in model['just_moved'][-1]['text'], model
+assert 'restarted after fix' in (home / 'data/board-full.md').read_text()
+assert 'elapsed' in (home / 'data/board-full.md').read_text()
+text = lab('pane', 'read', pane, '--source', 'visible', '--lines', '80')
+assert 'Just moved: latency: Needs -> Running' in text, text
+print(f'forge check change -> real viewer: {ci_latency:.3f}s (budget 10s)', flush=True)
+print('movement strip: latest Needs -> Running and restarted CI elapsed visible', flush=True)
+# A durable asked marker must change the same live viewer independently of chat.
+import shutil
+shutil.copyfile(pathlib.Path(root) / '.tasks.toml', home / '.tasks.toml')
+origin = home / 'data/board-review'
+origin.mkdir()
+(origin / 'report.md').write_text('# Board review\n')
+hold = subprocess.check_output([root + '/bin/fm-decision-hold.sh', 'hold', 'board-review', 'pilot',
+    '--title', 'Choose pilot', '--reason', 'Which pilot firm?', '--repo', 'cadenza'], env=env, text=True).strip()
+wait_visible('1 decision queued', time.monotonic())
+start = time.monotonic()
+subprocess.run([root + '/bin/fm-decision-hold.sh', 'ask', hold, '--question', 'Which pilot firm?'], env=env, check=True)
+asked_latency = wait_visible('Which pilot firm?', start)
+model = json.loads((home / 'state/board-model.json').read_text())
+assert model['counts']['need'] == 1 and model['counts']['queued'] == 0, model
+assert 'Waiting' in model['need'][0]['action'], model
+print(f'asked marker -> real viewer: {asked_latency:.3f}s (budget 10s)', flush=True)
+
+PYLATENCY
+
 # fm-goto lands on the worker: Herdr cannot focus a pane by id, so it focuses the owning tab.
 worker_tab=$(lab pane get "$worker" | jq -r '.result.pane.tab_id')
 cat > "$FM_HOME/state/goto-task.meta" <<META

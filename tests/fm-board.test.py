@@ -261,7 +261,7 @@ class Board(unittest.TestCase):
         (self.home / 'data/compensation-rules').mkdir(parents=True)
         (self.home / 'data/compensation-rules/brief.md').write_text('brief')
         self.run_board()
-        raw, text = self.frame('--width', '70', '--select', '1')
+        raw, text = self.frame('--width', '70', '--select', '1', '--detail')
         self.assertIn('\x1b[38;2;249;226;175m', raw)  # yellow: needs you
         self.assertIn('\x1b[38;2;250;179;135m', raw)  # peach: apply the database change first
         self.assertIn('\x1b[38;2;166;227;161m', raw)  # green: ready or done
@@ -406,6 +406,14 @@ class Board(unittest.TestCase):
 
         until('quit')
         self.assertIn('Needs you now', seen[0].decode(errors='replace'))
+        model_path = home / 'state/board-model.json'
+        model = json.loads(model_path.read_text())
+        model['need'][0]['action'] = 'Fresh movement observed without any keypress'
+        seen[0] = b''
+        start = time.monotonic()
+        model_path.write_text(json.dumps(model))
+        until('Fresh movement observed')
+        self.assertLess(time.monotonic() - start, 1)
         os.write(master, b'G')  # Unknown keys are harmless.
         os.write(master, b'f')
         until('Unknown task')  # only the full list reaches the sixth item
@@ -426,7 +434,7 @@ class Board(unittest.TestCase):
         self.snap['tasks'].append(fixture()['tasks'][6])
         self.run_board()
         for section, expected in [(1, 'Needs you now'), (2, 'Fee schedule'),
-                                  (3, 'Nobody is blocked'), (4, 'Bring back:')]:
+                                  (3, 'Dependencies may wait'), (4, 'Bring back:')]:
             raw, text = self.frame('--section', str(section), '--width', '60', '--height', '34')
             self.assertIn(expected, text)
             self.assertIn('Tab', text)
@@ -501,7 +509,7 @@ class Board(unittest.TestCase):
         p = launch()
         self.assertIn('Needs you now', read_frame('Needs you now'))
         for key, expected, token in [
-            (b'\t', 1, 'In motion'), (b'\t', 2, 'Nobody is blocked'),
+            (b'\t', 1, 'In motion'), (b'\t', 2, 'Dependencies may wait'),
             (b'\t', 3, 'Bring back:'), (b'\t', 0, 'Needs you now'),
             (b'\x1b[Z', 3, 'Bring back:'), (b'1', 0, 'Needs you now'),
             (b'2', 1, 'In motion'), (b'3', 2, '2d ago'), (b'4', 3, 'Bring back:')]:
@@ -521,7 +529,7 @@ class Board(unittest.TestCase):
             pref = json.loads((self.home / 'state/board-view.json').read_text())
             self.assertEqual(pref['section'], expected)
         os.write(master, b'3')
-        read_frame('Nobody is blocked')
+        read_frame('Dependencies may wait')
         for key, label in [(b'b', 'Brief'), (b'r', 'Report'), (b'\r', 'Detail')]:
             os.write(master, key)
             self.assertIn('Opened ' + label, read_frame('Opened ' + label))
@@ -638,7 +646,7 @@ class Board(unittest.TestCase):
         base['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Please review the PR')])
         base['pr'] = cases[0][0]
         self.run_board()
-        self.assertIn('CI RUNNING: 0 of 2 checks passed', self.full())
+        self.assertIn('CI RUNNING (restarted after fix): 0 of 2 checks passed', self.full())
         self.assertNotIn('Review the PR', self.full())
         base['pr'] = dict(url=url)
         self.run_board()
@@ -699,6 +707,218 @@ class Board(unittest.TestCase):
         self.run_board()
         self.assertIn('NEXT: merge', self.full())
         self.assertIn('owner: firstmate', self.full())
+
+    def test_lock_held_queues_one_follow_up_instead_of_losing_render(self):
+        (self.home / 'state').mkdir()
+        self.path.write_text(json.dumps(self.snap))
+        with (self.home / 'state/board.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for _ in range(6):
+                self.run_board()
+            self.assertFalse((self.home / 'state/board-model.json').exists())
+        deadline = time.monotonic() + 5
+        while not (self.home / 'state/board-model.json').exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertTrue((self.home / 'state/board-model.json').exists(), 'lock-held refresh was dropped')
+        self.assertIn('Should allowances', self.full())
+        stamp = (self.home / 'state/board-model.json').stat().st_mtime_ns
+        time.sleep(.3)
+        self.assertEqual(stamp, (self.home / 'state/board-model.json').stat().st_mtime_ns)
+
+    def test_just_moved_restart_elapsed_retention_and_expiry(self):
+        self.snap['tasks'] = [self.snap['tasks'][3]]
+        self.snap['backlog']['records'] = []
+        task = self.snap['tasks'][0]
+        task['pr']['live'] = True
+        self.run_board()
+        self.snap['generated'] = '2026-10-30T08:00:04Z'
+        task['pr']['check_runs'] = [dict(name='test', state='IN_PROGRESS')]
+        self.run_board()
+        self.assertIn('CI restarted after a fix, moved from Needs you to Running', self.board())
+        self.assertIn('CI RUNNING (restarted after fix): 0 of 1 checks passed, 0s elapsed', self.full())
+        _, text = self.frame('--width', '120', '--section', '1')
+        self.assertIn('Just moved:', text)
+        self.assertIn('Needs -> Running', text)
+        self.snap['generated'] = '2026-10-30T08:02:04Z'
+        self.run_board()
+        self.assertIn('2m elapsed', self.full())
+        self.assertIn('Just moved:', self.board())
+        self.snap['generated'] = '2026-10-30T08:05:05Z'
+        self.run_board()
+        self.assertNotIn('Just moved:', self.board())
+        self.assertIn('restarted after fix', self.full())
+        task['pr']['check_runs'] = [dict(name='test', state='SUCCESS')]
+        self.run_board()
+        self.assertIn('moved from Running to NEEDS YOU NOW', self.board())
+        self.assertNotIn('restarted after fix):', self.full())
+
+    def live_refresh_setup(self):
+        import hashlib
+        for directory in ('state', 'data', 'fakebin'):
+            (self.home / directory).mkdir(exist_ok=True)
+        label = 'Firstmate board ' + hashlib.sha256(str(self.home.resolve()).encode()).hexdigest()[:12]
+        fake = self.home / 'fakebin/herdr'
+        fake.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps(' + repr(dict(result=dict(panes=[dict(label=label, tab_id='tab', workspace_id='ws')]))) + '))\n')
+        fake.chmod(0o700)
+        fake = self.home / 'fakebin/tmux'
+        fake.write_text('#!/bin/sh\nexit 0\n')
+        fake.chmod(0o700)
+        forge = self.home / 'fakebin/gh'
+        forge.write_text('#!/bin/sh\necho offline >&2\nexit 1\n')
+        forge.chmod(0o700)
+        self.env.update(FM_BOARD_PARENT_PANE='parent', FM_BOARD_PARENT_TAB='tab',
+                        FM_BOARD_PARENT_WORKSPACE='ws', PATH=str(fake.parent) + os.pathsep + os.environ['PATH'])
+        (self.home / 'data/backlog.md').write_text('## In flight\n\n## Queued\n\n## Done\n')
+        (self.home / 'state/fake.meta').write_text('kind=scout\nharness=codex\nbackend=tmux\nwindow=lab:fm-fake\nworktree=' + str(self.home) + '\nproject=cadenza\n')
+        (self.home / 'state/fake.status').write_text('working: Implementing\n')
+
+    def live_refresh(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'bin/fm-board.py'), 'refresh'],
+                       env=self.env, capture_output=True, timeout=12, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_terminal_status_invalidates_warm_cache_within_ten_seconds(self):
+        self.live_refresh_setup()
+        self.live_refresh()
+        self.assertIn('fake [WORKING]', self.full())
+        start = time.monotonic()
+        with (self.home / 'state/fake.status').open('a') as out:
+            out.write('done: Committed parser repair | pr=none | checks=none | next=review | owner=firstmate\n')
+        with (self.home / 'state/board.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.live_refresh()
+        while time.monotonic() - start < 10:
+            if 'fake [NEXT: review]' in self.full():
+                break
+            time.sleep(.05)
+        self.assertIn('fake [NEXT: review]', self.full())
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIn('moved from Running to NEEDS YOU NOW', self.board())
+
+    def test_turn_end_invalidates_cached_canonical_worker_state(self):
+        self.live_refresh_setup()
+        worktree = self.home / 'worker-tree'
+        worktree.mkdir()
+        with (self.home / 'state/fake.meta').open('a') as out:
+            out.write('worktree=' + str(worktree) + '\n')
+        (self.home / 'state/fake.status').write_text('done: Committed | pr=none | checks=none | next=review | owner=firstmate\n')
+        self.live_refresh()
+        self.assertIn('fake [NEXT: review]', self.full())
+        worktree.rmdir()
+        (self.home / 'state/fake.turn-ended').touch()
+        self.live_refresh()
+        self.assertIn('worktree gone', self.full())
+        self.assertNotIn('fake [NEXT: review]', self.full())
+
+    def test_pr_cache_change_reprojects_while_slow_inventory_is_running(self):
+        import hashlib
+        self.live_refresh_setup()
+        url = 'https://github.com/example/cadenza/pull/1'
+        with (self.home / 'state/fake.meta').open('a') as out:
+            out.write('pr=' + url + '\n')
+        cache = self.home / 'state/board-pr-cache'
+        cache.mkdir()
+        path = cache / (hashlib.sha256(url.encode()).hexdigest() + '.json')
+        record = dict(url=url, live=True, state='OPEN', fetched_at=time.time(),
+                      check_runs=[dict(name='test', state='SUCCESS')])
+        path.write_text(json.dumps(record))
+        (self.home / 'state/fake.status').write_text('done: Finished\n')
+        self.live_refresh()
+        self.assertIn('fake [CI GREEN]', self.full())
+        # Model a long inventory producer by holding its separate singleton.
+        with (self.home / 'state/board-snapshot.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            bundle_path = self.home / 'state/board-snapshot.json'
+            bundle = json.loads(bundle_path.read_text())
+            bundle['time'] -= 31
+            bundle_path.write_text(json.dumps(bundle))
+            start = time.monotonic()
+            record['check_runs'] = [dict(name='test', state='IN_PROGRESS')]
+            path.write_text(json.dumps(record))
+            self.live_refresh()
+            self.assertLess(time.monotonic() - start, 2)
+        self.assertIn('CI RUNNING (restarted after fix)', self.full())
+        self.assertIn('moved from Needs you to Running', self.board())
+
+    def test_asked_decisions_question_age_and_unasked_counts(self):
+        self.snap['tasks'] = []
+        self.snap['backlog']['records'] = [dict(id='asked', title='Choose compensation',
+            structured=True, kind='captain', hold_kind='captain', repo='continuo', state='queued',
+            asked=dict(asked_at='2026-10-30T06:00:00Z', question='Which pay basis?')),
+            dict(id='unasked', title='Later legal decision', structured=True, kind='captain',
+                 hold_kind='captain', repo='continuo', state='queued')]
+        self.run_board()
+        model = json.loads((self.home / 'state/board-model.json').read_text())
+        self.assertEqual(model['counts']['need'], 1)
+        self.assertEqual(model['counts']['queued'], 1)
+        self.assertIn('Waiting 2h: Which pay basis?', model['need'][0]['action'])
+        self.assertEqual([item['id'] for item in model['queued']], ['unasked'])
+        _, text = self.frame('--section', '1', '--width', '100')
+        self.assertIn('Which pay basis?', text)
+        self.assertIn('Waiting 2h', text)
+
+    def test_structured_captain_actions_survive_running_ci_and_remote_summary(self):
+        task = self.snap['tasks'][3]
+        task['pr']['check_runs'] = [dict(name='test', state='IN_PROGRESS')]
+        task['current_state'].update(state='blocked', source='status-log', detail='Choose the release region')
+        self.snap['tasks'] = [task]
+        self.snap['backlog']['records'] = []
+        for action in ('captain-decision', 'prod-apply'):
+            task['current_state']['end_state'] = dict(pr=task['pr']['url'], checks='running', next=action, owner='captain')
+            self.run_board()
+            model = json.loads((self.home / 'state/board-model.json').read_text())
+            self.assertEqual(model['counts']['need'], 1)
+            self.assertEqual(model['counts']['moving'], 0)
+            self.assertIn('owner: captain', model['need'][0]['action'])
+        self.snap['tasks'] = []
+        self.snap['secondmate_current'] = dict(records=[dict(id='mate', freshness=dict(status='fresh'),
+            endpoints=[dict(id='confirm', title='Confirm rollout', state='paused', detail='Confirm the firm before rollout',
+                end_state=dict(pr='none', checks='none', next='captain-decision', owner='captain'))])])
+        self.run_board()
+        model = json.loads((self.home / 'state/board-model.json').read_text())
+        self.assertEqual(model['need'][0]['scope'], 'mate')
+        self.assertIn('Confirm the firm', model['need'][0]['action'])
+
+    def test_queued_dependency_branches_without_any_running_worker(self):
+        self.snap['tasks'] = []
+        edges = {'ep11': [], 'ep6': [], 'ep12': ['ep11'], 'ep13a': ['ep11'],
+                 'ep14': ['ep11'], 'ep20': ['ep11'], 'ep24': ['ep6', 'ep11'],
+                 'ep28': ['ep13a', 'ep14', 'ep20']}
+        (self.home / 'data').mkdir()
+        (self.home / 'state').mkdir()
+        lines = ['## In flight', '', '## Queued']
+        for key, deps in edges.items():
+            lines.append('- [ ] ' + key + ' - ' + key + ''.join(' blocked-by: ' + dep for dep in deps) + ' (repo: continuo) (kind: ship)')
+        (self.home / 'data/backlog.md').write_text('\n'.join(lines) + '\n\n## Done\n')
+        subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=self.env, check=True, capture_output=True)
+        model = json.loads((self.home / 'state/board-model.json').read_text())
+        self.assertEqual(len(model['programmes']), 1)
+        steps = {step['id']: step for step in model['programmes'][0]['steps']}
+        self.assertEqual(steps['ep12']['after'], ['ep11'])
+        self.assertEqual(steps['ep24']['after'], ['ep6', 'ep11'])
+        self.assertEqual(steps['ep28']['after'], ['ep13a', 'ep14', 'ep20'])
+        self.assertEqual(steps['ep28']['state'], 'wait')
+        for options in [('--detail',), ('--section', '2', '--select', '7')]:
+            _, text = self.frame('--width', '100', *options)
+            self.assertIn('ep28', text)
+            self.assertIn('ep13a, ep14, ep20', text)
+            self.assertIn('Waiting on:', text)
+        _, text = self.frame('--width', '70')
+        self.assertIn('In motion', text)
+        self.assertNotIn('Nothing is running.', text)
+
+    def test_summary_needs_has_eight_content_lines_and_press_one_overflow(self):
+        self.snap['tasks'] = [dict(self.snap['tasks'][0], id='ask-' + str(n),
+             backlog=dict(title='Question ' + str(n), repo='continuo')) for n in range(12)]
+        self.snap['backlog']['records'] = []
+        self.run_board()
+        _, text = self.frame('--width', '90')
+        section = text.split('Needs you now')[1].split('In motion')[0].splitlines()[1:]
+        content = [line for line in section if line.strip() and '+8 more' not in line]
+        self.assertLessEqual(len(content), 8)
+        self.assertIn('+8 more, press 1', text)
+        _, detail = self.frame('--section', '1', '--width', '90')
+        self.assertIn('Question 11', detail)
 
     def test_real_canonical_snapshot_backlog(self):
         (self.home / 'data').mkdir()
