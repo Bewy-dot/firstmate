@@ -3,7 +3,7 @@
 # Usage: fm-board.sh [refresh|render|view] [--snapshot <canonical-json-file>]
 #                    [--home-snapshot <second-mate-id>=<file>]
 # refresh is a fail-soft presentation operation, automatically called by the
-# watcher. It no-ops outside Herdr, requires the adapter's verified launcher
+# watcher and viewer, including directly on status detection. It no-ops outside Herdr, requires the adapter's verified launcher
 # identity, and never starts a server or closes a pane. view is the terminal
 # board (j/k, Enter to go to a worker's pane, o/b/r to open); view --once
 # [--width N] [--select N] [--detail] prints one frame and exits.
@@ -11,6 +11,7 @@
 # any backend; --snapshot imports a previously captured fm-fleet-snapshot.v1
 # object for offline previews and fixture tests, and --home-snapshot imports a
 # second mate's own-home snapshot the same way.
+# Contended refreshes queue one follow-up; warm renders reuse canonical records.
 # Data model, config, and rendering are owned by fm-board.py and fm_board_tui.py;
 # fleet semantics remain owned by fm-fleet-snapshot.sh and fm-crew-state.sh.
 set -eu
@@ -18,7 +19,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}}"
 case "${1:-refresh}" in
-  -h|--help) sed -n '2,17s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,18s/^# \{0,1\}//p' "$0"; exit 0 ;;
   render|view) exec python3 "$SCRIPT_DIR/fm-board.py" "$@" ;;
   refresh) [ "$#" -eq 0 ] || shift ;;
   *) echo 'fm-board: expected refresh, render, or view' >&2; exit 2 ;;

@@ -6,6 +6,11 @@
 # The command is read-only: it does not acquire the session lock, drain wakes,
 # arm watchers, mutate backlog state, or write reports.
 #
+# --task-json ID emits the same canonical tasks array for one recorded worker,
+# without backlog or cross-home collection, for incremental presentation reads.
+# --backlog-json emits only the canonical backlog object, including asked markers
+# whose storage format is owned by fm-decision-hold.sh.
+#
 # Top-level fields:
 #   schema: stable schema id.
 #   generated: UTC observation time for this fresh command execution.
@@ -143,6 +148,8 @@ usage() {
   cat <<'EOF'
 usage: fm-fleet-snapshot.sh --json
        fm-fleet-snapshot.sh --secondmate-home-summary
+       fm-fleet-snapshot.sh --task-json ID
+       fm-fleet-snapshot.sh --backlog-json
 
 Print a read-only structured snapshot of the firstmate fleet.
 JSON is the stable machine-readable output contract.
@@ -171,6 +178,12 @@ EOF
 OUTPUT_MODE=json
 case "${1:---json}" in
   --json) ;;
+  --backlog-json) OUTPUT_MODE='backlog-json' ;;
+  --task-json)
+    [ "$#" -eq 2 ] && [[ "$2" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || { usage >&2; exit 2; }
+    OUTPUT_MODE='task-json'
+    SNAPSHOT_TASK_ID=$2
+    ;;
   --secondmate-home-summary) OUTPUT_MODE=secondmate-home-summary ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
@@ -271,7 +284,7 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
   fi
 
   # shellcheck disable=SC2094
-  jq -Rn --arg path "$backlog" '
+  jq -Rn --argjson asked "$(if [ -f "$DATA/decision-asked.json" ]; then cat "$DATA/decision-asked.json"; else printf '{}'; fi)" --arg path "$backlog" '
     def trim: gsub("^[[:space:]]+|[[:space:]]+$"; "");
     def section_state:
       if . == "In flight" then "in_flight"
@@ -393,6 +406,7 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
     | .records |= map(
         if .structured then
           . as $record
+          | .asked = (if .state != "done" then $asked[.id] // null else null end)
           | .unresolved_blocker_ids = [
               $record.blocked_by_ids[] as $blocker
               | select($resolved_ids[$blocker] != true)
@@ -423,6 +437,7 @@ task_json_lines() {
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     id=$(basename "$meta" .meta)
+    [ -z "${SNAPSHOT_TASK_ID:-}" ] || [ "$id" = "$SNAPSHOT_TASK_ID" ] || continue
     kind=$(meta_value "$meta" kind)
     [ -n "$kind" ] || kind=ship
     harness=$(meta_value "$meta" harness)
@@ -779,7 +794,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
           blocked_reason:((.blocked_reason // null) | if . == null then null else trunc(160) end),
           hold_reason:((.hold_reason // null) | if . == null then null else trunc(160) end),
           hold_kind:((.hold_kind // null) | if . == null then null else trunc(40) end),
-          captain_actionable:(.captain_actionable // false),
+          captain_actionable:(.captain_actionable // false),asked:(.asked // null),
           repo:((.repo // null) | if . == null then null else trunc(120) end),
           kind:((.kind // null) | if . == null then null else trunc(40) end)}][:$queued_n]),
         landed:(if $landed_n == 0 then $landed_all else $landed_all[:$landed_n] end),
@@ -1392,6 +1407,16 @@ scout_report_lines() {
     done \
     | jq -s 'sort_by(.id)'
 }
+
+if [ "$OUTPUT_MODE" = backlog-json ]; then
+  backlog_json
+  exit $?
+fi
+
+if [ "$OUTPUT_MODE" = task-json ]; then
+  task_json_lines
+  exit $?
+fi
 
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
 TASKS_JSON=$(task_json_lines) || { echo "fm-fleet-snapshot: task snapshot failed" >&2; exit 1; }

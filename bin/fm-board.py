@@ -17,8 +17,19 @@ the structured projection the terminal viewer (fm_board_tui.py) draws.
 --pr-snapshot imports the existing opt-in fm-bearings.v1 candidate_prs evidence
 by exact URL and recorded head, without making any network calls.
 Normal renders read the asynchronous fm_pr_state cache and schedule a refresh.
+Warm renders reuse state/board-snapshot.json; a separate singleton collects the
+full fleet every 30s or after structural input changes, outside board.lock.
+Changed local workers use the canonical --task-json reader (four concurrent
+reads, one-second validation CLI timeout and eight-second total timeout each), persisted in board-task-cache.json.
+board-refresh.json suppresses identical refreshes for two seconds; fingerprints
+include turn ends, metadata, status, busy markers, local homes and PR cache files.
+A contended publisher elects one detached waiter through board-follow-up.lock.
+Movement history in board-model.json retains five transitions for 300s; the
+restart clock is the observation of a Needs-to-Running CI transition, not a
+claim about the push timestamp. Offline fixtures never read a live home/cache.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import fcntl
 import hashlib
@@ -174,7 +185,11 @@ def pr_checks(pr, now=None):
         if starts:
             minutes = int((now - min(starts)).total_seconds() // 60)
             age = ', ' + (str(minutes) + 'm elapsed' if minutes else 'under 1m elapsed')
-        label = f'CI RUNNING: {passed} of {len(checks)} checks passed' + age
+        if pr.get('restarted_at') and now:
+            seconds = max(0, int(now.timestamp() - pr['restarted_at']))
+            age = ', ' + (str(seconds // 60) + 'm elapsed' if seconds >= 60 else str(seconds) + 's elapsed')
+        restart = ' (restarted after fix)' if pr.get('restarted_at') else ''
+        label = f'CI RUNNING{restart}: {passed} of {len(checks)} checks passed' + age
         return label, SECTIONS[1], label + suffix
     if other:
         names = ', '.join(plain(c.get('name') or c.get('context') or 'unnamed check') for c in other)
@@ -215,6 +230,11 @@ def task_view(task, titles=None, merged=frozenset(), now=None):
         return 'NEEDS ANSWER', SECTIONS[0], '; '.join(plain(d['summary']) for d in questions)
     if url in merged and state in ('done', 'paused', 'unknown'):
         return 'MERGED', SECTIONS[2], 'Merged'
+    if fields.get('owner') == 'captain' and fields.get('next') in ('captain-decision', 'prod-apply'):
+        label = 'NEEDS ANSWER' if fields['next'] == 'captain-decision' else 'NEXT: prod-apply'
+        return label, SECTIONS[0], (detail.split(' | ')[0] or 'Awaiting explicit captain confirmation') + '; next: ' + fields['next'] + '; owner: captain'
+    if state in ('blocked', 'parked') and backlog.get('hold_kind') == 'captain':
+        return 'HOLDING', SECTIONS[0], plain(backlog.get('hold_reason')) or detail or 'Awaiting your answer'
     if checks and checks[0].startswith(('CI RUNNING', 'CI FAILED', 'PR FETCH FAILED')):
         return checks
     if state == 'failed':
@@ -246,6 +266,8 @@ def task_view(task, titles=None, merged=frozenset(), now=None):
         return checks
     if backlog.get('hold_kind') == 'captain' or state == 'parked':
         return 'HOLDING', SECTIONS[0], plain(backlog.get('hold_reason')) or detail or 'Awaiting your word to continue'
+    if fields.get('owner') == 'captain' and fields.get('next') == 'merge':
+        return 'NEXT: merge', SECTIONS[0], 'Give the merge word; ' + detail.split(' | ')[0]
     if state == 'paused':
         return 'PAUSED', SECTIONS[3], detail or 'Waiting for external work; trigger not recorded'
     if state in ('blocked', 'failed') or any(d.get('verb') == 'blocked' for d in decisions):
@@ -263,16 +285,22 @@ def task_view(task, titles=None, merged=frozenset(), now=None):
     return 'BLOCKED', SECTIONS[0], 'Check worker state: ' + (detail or 'current state unavailable')
 
 
-def backlog_view(record):
+def backlog_view(record, now=None):
     if record.get('state') == 'done':
         return 'DONE', SECTIONS[2], 'Completed'
     blockers = record.get('unresolved_blocker_ids') or []
     reason = plain(record.get('hold_reason') or record.get('blocked_reason') or record.get('reason'))
+    asked = record.get('asked') or {}
+    if asked.get('asked_at'):
+        observed = dt.datetime.fromisoformat(asked['asked_at'].replace('Z', '+00:00'))
+        seconds = max(0, int(((now or dt.datetime.now(dt.timezone.utc)) - observed).total_seconds()))
+        age = str(seconds // 86400) + 'd' if seconds >= 86400 else str(seconds // 3600) + 'h' if seconds >= 3600 else str(seconds // 60) + 'm' if seconds >= 60 else 'under 1m'
+        return 'NEEDS ANSWER', SECTIONS[0], 'Waiting ' + age + ': ' + (plain(asked.get('question')) or reason or plain(record.get('title')))
     # Eligibility is not evidence that this filed decision has been asked.
     if record.get('kind') == 'captain' or record.get('hold_kind') == 'captain' or record.get('captain_actionable') or record.get('verb') == 'captain-hold':
-        return 'QUEUED', SECTIONS[4], reason or 'Filed; not yet asked'
+        return 'QUEUED', SECTIONS[4], (reason or 'Filed; not yet asked') + ('; waiting on ' + ', '.join(blockers) if blockers else '')
     if blockers:
-        return 'WAITING', SECTIONS[3], 'After ' + ', '.join(blockers)
+        return 'WAITING', SECTIONS[1], 'Waiting on ' + ', '.join(blockers)
     if record.get('current_role') == 'program' or record.get('kind') == 'program':
         return 'PROGRAMME', SECTIONS[3], reason or 'Continue when its linked work is ready'
     if record.get('state') == 'in_flight' and record.get('current_role') == 'worker':
@@ -350,7 +378,7 @@ def project(snapshot, rules, homes=None):
             taken.add(task['id'])
         for record in recs:
             if record.get('structured') and record['id'] not in taken:
-                label, section, action = backlog_view(record)
+                label, section, action = backlog_view(record, now)
                 add(record, label, section, action, scope=scope, snap=snap)
                 names.append(label)
         return names
@@ -416,9 +444,9 @@ def summary_children(owner, add, now):
             task = dict(backlog=record, current_state=dict(state=state, source=current.get('source'),
                         end_state=current.get('end_state') or {}, detail=current.get('detail') or current.get('doing') or current.get('reason')),
                         hints=dict(open_decisions=child['decisions']), pr=current.get('pr') or dict(url=record.get('pr_url')))
-            label, section, action = task_view(task, child_titles)
+            label, section, action = task_view(task, child_titles, now=now)
         else:
-            label, section, action = backlog_view(record)
+            label, section, action = backlog_view(record, now)
         owner_labels.append(label)
         if label in ('MERGED', 'CLOSED'):
             record.setdefault('completion', dict(date=now.date().isoformat()))
@@ -638,7 +666,7 @@ def step_state(row):
     if row['section'] == SECTIONS[0]:
         return ('fail', 'failed') if row['failed'] else ('need', 'stuck' if label in ('BLOCKED', 'CHECK') else 'needs you')
     if label == 'QUEUED':
-        return 'queued', 'decision'
+        return ('wait', 'waiting on prerequisite') if row['record'].get('unresolved_blocker_ids') else ('queued', 'decision')
     return 'wait', 'paused' if label == 'PAUSED' else 'waiting'
 
 
@@ -668,6 +696,7 @@ def build_model(rows, components, counts, programme_names, now, snapshot, merged
         return dict(id=row['record']['id'], scope=row['scope'], group=row['group'],
                     title=short(row['record'].get('title') or row['record']['id'], 64),
                     label=row['label'], action=plain(row['action']), loc=pane_loc(row),
+                    after=list(row['record'].get('unresolved_blocker_ids') or []),
                     goto=goto_of(row), files=row_files(row),
                     prs=[dict(label=pr_label(u), url=u) for u in pr_links(row, merged)])
 
@@ -679,8 +708,8 @@ def build_model(rows, components, counts, programme_names, now, snapshot, merged
                 need.append(dict(common(row), tone=tone, pill=pill, icon=icon))
     programmes = []
     for component in components:
-        steps = [r for r in component['rows'] if r['section'] != SECTIONS[4]]
-        if not any(r['section'] == SECTIONS[1] for r in steps):
+        steps = component['rows']
+        if not any(r['section'] == SECTIONS[1] or r['record'].get('blocked_by_ids') for r in steps):
             continue
         key = (steps[0]['scope'], steps[0]['record']['id'])
         name = next((programme_names[(r['scope'], r['record']['id'])] for r in steps
@@ -725,6 +754,8 @@ def build_model(rows, components, counts, programme_names, now, snapshot, merged
     return dict(schema='fm-board-model.v1', generated=snapshot['generated'], home=snapshot.get('fm_home'),
                 counts=dict(need=counts[SECTIONS[0]], moving=counts[SECTIONS[1]], queued=counts[SECTIONS[4]],
                             parked=counts[SECTIONS[3]], done=counts[SECTIONS[2]]),
+                positions={r['scope'] + '/' + r['record']['id']: dict(section=r['section'], label=r['label'],
+                           title=plain(r['record'].get('title') or r['record']['id'])) for r in rows},
                 need=need, programmes=programmes, queued=entries(SECTIONS[4]), parked=entries(SECTIONS[3]),
                 quiet=dict(queued=tally(SECTIONS[4]), parked=tally(SECTIONS[3]), done=done),
                 notice='Worker records need attention; check the fleet status report.'
@@ -822,16 +853,175 @@ def update_panes(home, labels):
     herdr(session, 'pane', 'run', pane, command)
 
 
-def fingerprint(home):
-    paths = [home / 'data/backlog.md', home / 'config/board-groups.json', home / 'state/board-pr-updated.json']
-    for pattern in ('*.meta', '*.status', '*.busy*'):
-        paths += sorted((home / 'state').glob(pattern))
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def file_signature(paths):
     digest = hashlib.sha256()
-    for path in paths:
-        if path.is_file():
-            digest.update(str(path).encode())
-            digest.update(path.read_bytes())
+    for path in sorted(set(paths)):
+        digest.update(str(path).encode())
+        try:
+            st = path.stat()
+            digest.update(str((st.st_mtime_ns, st.st_size, st.st_ino)).encode())
+        except FileNotFoundError:
+            digest.update(b'absent')
     return digest.hexdigest()
+
+
+def task_signature(home, task):
+    return file_signature([home / 'state' / (task + suffix)
+                           for suffix in ('.meta', '.status', '.turn-ended')]
+                          + list((home / 'state').glob(task + '.busy*')))
+
+
+def fingerprint(home):
+    paths = [home / 'data' / name for name in ('backlog.md', 'secondmates.md', 'projects.md', 'decision-asked.json')]
+    paths += list((home / 'config').glob('*'))
+    for pattern in ('*.meta', '*.status', '*.turn-ended', '*.busy*', 'board-pr-cache/*.json',
+                    'board-pr-updated.json', 'board-snapshot.json'):
+        paths += list((home / 'state').glob(pattern))
+    # Local child homes are discovered from the canonical snapshot, never from
+    # another registry parser. Include their section-changing files as well.
+    bundle = read_json(home / 'state/board-snapshot.json', {})
+    for owned in bundle.get('homes', {}).values():
+        child = Path(owned['fm_home'])
+        for pattern in ('*.meta', '*.status', '*.turn-ended', '*.busy*'):
+            paths += list((child / 'state').glob(pattern))
+        paths.extend(child / 'data' / name for name in ('backlog.md', 'decision-asked.json'))
+    return file_signature(paths)
+
+
+def collection_signature(home, homes):
+    paths = [home / 'data' / name for name in ('backlog.md', 'secondmates.md', 'projects.md', 'decision-asked.json')]
+    paths += [Path(snap['fm_home']) / 'data' / name for snap in homes.values()
+              for name in ('backlog.md', 'decision-asked.json')]
+    return file_signature(paths)
+
+
+def collect_snapshots(home):
+    # Expensive inventory runs outside the publication lock. Capture signatures
+    # BEFORE the reads so a racing status append is re-read incrementally.
+    prior = read_json(home / 'state/board-snapshot.json', {})
+    structure = collection_signature(home, prior.get('homes', {}))
+    owners = {'': {'fm_home': str(home)}, **prior.get('homes', {})}
+    signatures = {scope + '/' + p.stem: task_signature(Path(owned['fm_home']), p.stem)
+                  for scope, owned in owners.items()
+                  for p in (Path(owned['fm_home']) / 'state').glob('*.meta')}
+    snapshot = json.loads(subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--json'],
+                          text=True, timeout=180, env=dict(os.environ, FM_HOME=str(home))))
+    args = argparse.Namespace(snapshot=None, home_snapshot=None)
+    homes = home_snapshots(args, snapshot)
+    # Do not assert freshness of child tasks whose read preceded these stamps.
+    write_atomic(home / 'state/board-snapshot.json', json.dumps(dict(
+        snapshot=snapshot, homes=homes, signatures=signatures, structure=structure, time=time.time())))
+
+
+def live_snapshots(home):
+    path = home / 'state/board-snapshot.json'
+    bundle = read_json(path, {})
+    if not bundle:
+        collect_snapshots(home)
+        bundle = read_json(path, {})
+    elif time.time() - bundle['time'] >= 30 or bundle.get('structure') != collection_signature(home, bundle['homes']):
+        with (home / 'state/board-snapshot.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'collect', str(lock.fileno())],
+                                 pass_fds=(lock.fileno(),), start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    snapshot, homes = bundle['snapshot'], bundle['homes']
+    saved = read_json(home / 'state/board-task-cache.json', {})
+    for scope, snap in [('', snapshot), *homes.items()]:
+        owner = Path(snap.get('fm_home') or home)
+        present = {p.stem for p in (owner / 'state').glob('*.meta')}
+        tasks = {task['id']: task for task in snap.get('tasks', []) if task['id'] in present}
+        backlog_sig = file_signature([owner / 'data' / name for name in ('backlog.md', 'decision-asked.json')])
+        key = '_backlog/' + scope
+        if saved.get(key, {}).get('signature') != backlog_sig:
+            raw = subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--backlog-json'],
+                    text=True, timeout=5, env=dict(os.environ, FM_HOME=str(owner)))
+            saved[key] = dict(signature=backlog_sig, value=json.loads(raw))
+        snap['backlog'] = saved[key]['value']
+        records = {row['id']: row for row in snap['backlog'].get('records', [])}
+        def current(task):
+            sig = task_signature(owner, task)
+            key = scope + '/' + task
+            cached = saved.get(key, {})
+            if cached.get('signature') == sig and cached.get('time', 0) >= bundle['time']:
+                row = cached['row']
+                return task, dict(row, backlog=records.get(task, {})) if row else None
+            if bundle['signatures'].get(key) == sig and task in tasks:
+                return task, dict(tasks[task], backlog=records.get(task, {}))
+            out = subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--task-json', task],
+                    text=True, timeout=8, env=dict(os.environ, FM_HOME=str(owner), FM_CREW_STATE_NM_TIMEOUT='1'))
+            rows = json.loads(out)
+            row = rows[0] if rows else None
+            if row is not None:
+                row['backlog'] = records.get(task, {})
+            saved[key] = dict(signature=sig, row=row, time=time.time())
+            return task, row
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            snap['tasks'] = [row for _, row in pool.map(current, sorted(present)) if row is not None]
+        snap['generated'] = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_atomic(home / 'state/board-task-cache.json', json.dumps(saved))
+    return snapshot, homes
+
+
+def transition_history(snapshot, homes, rules, previous):
+    """Bounded presentation history, never fleet or delivery authority."""
+    now = dt.datetime.fromisoformat(snapshot['generated'].replace('Z', '+00:00')).timestamp()
+    _, _, _, projected = project(snapshot, rules, homes)
+    current = projected['positions']
+    history = [item for item in previous.get('just_moved', []) if 0 <= now - item['at'] < 300]
+    prior = previous.get('positions', {})
+    restarts = previous.get('ci_restarts', {})
+    for key, row in current.items():
+        old = prior.get(key)
+        if old and old['section'] != row['section']:
+            restarted = old['section'] == SECTIONS[0] and row['label'].startswith('CI RUNNING')
+            reason = 'CI restarted after a fix' if restarted else row['label']
+            text = row['title'] + ': ' + reason + ', moved from ' + old['section'].replace('NEEDS YOU NOW', 'Needs you') + ' to ' + row['section']
+            names = {SECTIONS[0]: 'Needs', SECTIONS[1]: 'Running', SECTIONS[2]: 'Done',
+                     SECTIONS[3]: 'Parked', SECTIONS[4]: 'Queued'}
+            compact = short(row['title'], 12) + ': ' + names.get(old['section'], old['section']) + ' -> ' + names.get(row['section'], row['section'])
+            compact += '; CI restarted' if restarted else '; ' + short(row['label'], 16)
+            history.append(dict(at=now, text=text, compact=compact))
+            if restarted:
+                restarts[key] = now
+        if not row['label'].startswith('CI RUNNING'):
+            restarts.pop(key, None)
+    for scope, snap in [('', snapshot), *homes.items()]:
+        for task in snap.get('tasks', []):
+            key = scope + '/' + task['id']
+            if key in restarts and key in current:
+                task.setdefault('pr', {})['restarted_at'] = restarts[key]
+    for owner in snapshot.get('secondmate_current', {}).get('records', []):
+        for endpoint in owner.get('endpoints', []):
+            key = owner['id'] + '/' + endpoint['id']
+            if key in restarts:
+                endpoint.setdefault('pr', {})['restarted_at'] = restarts[key]
+    return dict(just_moved=history[-5:], positions=current,
+                ci_restarts={k: v for k, v in restarts.items() if k in current})
+
+
+def queue_refresh(home):
+    # One detached waiter per active publisher. Its inherited queue lock closes
+    # the election race, and it releases that lock only after owning board.lock.
+    with (home / 'state/board-follow-up.lock').open('a') as queue:
+        try:
+            fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], '--wait-lock-fd', str(queue.fileno())]
+        subprocess.Popen(argv, pass_fds=(queue.fileno(),), start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def refresh(args, home):
@@ -839,21 +1029,29 @@ def refresh(args, home):
     state.mkdir(parents=True, exist_ok=True)
     with (state / 'board.lock').open('a') as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flags = fcntl.LOCK_EX if args.wait_lock_fd is not None else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(lock, flags)
         except BlockingIOError:
+            queue_refresh(home)
             return
+        if args.wait_lock_fd is not None:
+            os.close(args.wait_lock_fd)
         signature = fingerprint(home)
         cache = state / 'board-refresh.json'
         if args.command == 'refresh' and not args.snapshot and not args.pr_snapshot and cache.exists():
-            prior = json.loads(cache.read_text())
-            if prior.get('signature') == signature and time.time() - prior.get('time', 0) < 30:
+            prior = read_json(cache, {})
+            if prior.get('signature') == signature and time.time() - prior.get('time', 0) < 2:
                 return
         rules = mapping(home)
-        snapshot = json.loads(Path(args.snapshot).read_text()) if args.snapshot else json.loads(subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--json'], text=True, timeout=180))
+        snapshot, homes = live_snapshots(home) if not args.snapshot else (json.loads(Path(args.snapshot).read_text()), {})
         if snapshot.get('schema') != 'fm-fleet-snapshot.v1':
             raise ValueError('expected fm-fleet-snapshot.v1')
         snapshot.setdefault('fm_home', str(home))
-        homes = home_snapshots(args, snapshot)
+        if args.snapshot:
+            homes = home_snapshots(args, snapshot)
+        elif args.home_snapshot:
+            homes.update({owner: read_json(Path(path), {}) for owner, path in
+                          (spec.split('=', 1) for spec in args.home_snapshot)})
         if args.pr_snapshot:
             evidence = json.loads(Path(args.pr_snapshot).read_text())
             if evidence.get('schema') != 'fm-bearings.v1':
@@ -870,7 +1068,14 @@ def refresh(args, home):
             import fm_pr_state
             fm_pr_state.enrich(home, [snapshot, *homes.values()])
 
+        previous = read_json(state / 'board-model.json', {})
+        history = transition_history(snapshot, homes, rules, previous)
         generated, full, labels, model = project(snapshot, rules, homes)
+        model.update(history)
+        if history['just_moved']:
+            strip = 'Just moved: ' + ' | '.join(item['text'] for item in history['just_moved']) + '\n\n'
+            generated = generated.replace('# Crew board\n\n', '# Crew board\n\n' + strip, 1)
+            full = full.replace('# Crew board - full detail\n\n', '# Crew board - full detail\n\n' + strip, 1)
         write_board(home / 'data/board-full.md', full)
         write_board(home / 'data/board.md', generated)
         write_atomic(state / 'board-model.json', json.dumps(model, indent=1) + '\n')
@@ -921,6 +1126,7 @@ def main():
     parser.add_argument('--section', type=int, choices=range(1, 5), help='view --once: section 1 to 4; omitted means the compact summary')
     parser.add_argument('--pr-snapshot', help='render/refresh: offline fm-bearings.v1 from the opt-in --include-prs path')
     parser.add_argument('--snapshot')
+    parser.add_argument('--wait-lock-fd', type=int, help=argparse.SUPPRESS)
     parser.add_argument('--home-snapshot', action='append', metavar='ID=FILE')
     args = parser.parse_args()
     home = Path(os.environ['FM_HOME']).resolve()
@@ -932,7 +1138,11 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        if len(sys.argv) == 3 and sys.argv[1] == 'collect':
+            with os.fdopen(int(sys.argv[2])):
+                collect_snapshots(Path(os.environ['FM_HOME']))
+        else:
+            main()
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
         print('fm-board: ' + str(exc), file=sys.stderr)
         sys.exit(1)

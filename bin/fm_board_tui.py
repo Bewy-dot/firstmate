@@ -40,7 +40,7 @@ PLAIN = dict(capl='', capr='', soft='|', db='$', ask='?', merge='+', eye='o', fl
              done='*', run='>', wait='.', park='=', need='!', queued='?', folder='', clock='',
              go='Enter', bar='|')
 STATE_COLOUR = dict(done='green', run='blue', wait='sub', need='yellow', fail='peach', queued='sub')
-SUMMARY_NEED, SUMMARY_MOVING = 5, 4
+SUMMARY_NEED, SUMMARY_MOVING = 4, 4
 
 
 def glyphs():
@@ -179,7 +179,8 @@ def heading(text, colour, count=None, w=60):
 def need_lines(G, model, entry, w, selected, expanded, full=False):
     item, mark = entry['item'], [seg(' ' + G['bar'] + ' ', 'mauve')] if selected else [seg('   ')]
     badge = pill(G, item['pill'], item['tone'], icon=item['icon']) + [seg(' ')]
-    lines = [pad_between(mark + [seg(clip(item['title'], w - 3 - width(badge) - 2), 'text', bold=True)], badge, w)]
+    lines = [pad_between(mark + [seg(clip(item['title'], w - 3 - width(badge) - 2), 'text', bold=True,
+        link=next((url for _, url in item_links(model, item)), None))], badge, w)]
     ask = textwrap.wrap(item['action'], w - 4) or ['']
     shown = ask[:4] if full else ask[:2] if expanded else ask[:1]
     if len(ask) > len(shown):
@@ -213,7 +214,11 @@ def programme_line(G, entry, w, selected):
     if len(p['steps']) > 6:
         chain.append(seg('+' + str(len(p['steps']) - 6), 'sub'))
     current = target_step(entry)
-    right = [seg(clip(current['word'], max(14, w // 2)) + ' ', STATE_COLOUR[current['state']])]
+    word = current['word']
+    if 'restarted after fix' in word:
+        elapsed = re.search(r'(\d+[sm]) elapsed', word)
+        word = 'CI restarted' + (' ' + elapsed[1] if elapsed else '')
+    right = [seg(clip(word, max(14, w // 2)) + ' ', STATE_COLOUR[current['state']])]
     room = w - 3 - width(chain) - 2 - width(right) - 1
     return pad_between(mark + chain + [seg('  ' + clip(programme_title(p), room), 'text')], right, w)
 
@@ -235,6 +240,8 @@ def rail_lines(G, p, w, selected):
         after = '' if p['linear'] or not step['after'] else ' (after ' + ', '.join(step['after']) + ')'
         row = mark + [seg(G[step['state']] + ' ', colour), seg(clip(step['title'] + after, w - 22), 'text')]
         lines.append(pad_between(row, [seg(step['word'] + ' ', colour)], w))
+        if step['after']:
+            lines.extend(mark + [seg(line, 'sub')] for line in textwrap.wrap('Waiting on: ' + ', '.join(step['after']), max(10, w - 4)))
         if n < len(steps) - 1:
             dashed = steps[n + 1]['state'] in ('wait', 'queued')
             lines.append(mark + [seg('╎' if dashed else '│', 'overlay0' if dashed else colour)])
@@ -268,9 +275,9 @@ def quiet_lines(G, model, w, full):
 def section_lines(model, w, selected, full, section):
     G, lines, span = glyphs(), [], (0, 0)
     targets = targets_of(model, section)
-    lines += [bar_line(G, model, w, section), [], heading(SECTIONS[section], 'mauve', str(len(targets)), w)]
+    lines += [bar_line(G, model, w, section)] + moved_line(model, w) + [[], heading(SECTIONS[section], 'mauve', str(len(targets)), w)]
     if section == 2:
-        lines += [[seg('  Filed; not yet asked. Nobody is blocked.', 'sub')]]
+        lines += [[seg('  Filed; not yet asked. Dependencies may wait.', 'sub')]]
     if not targets:
         lines += [[seg('  ' + ('Nothing needs you right now.', 'Nothing is running.', 'Nothing queued', 'Nothing parked')[section], 'sub')]]
     group = None
@@ -290,6 +297,8 @@ def section_lines(model, w, selected, full, section):
             state = item['state']
             after = ' (after ' + ', '.join(item['after']) + ')' if item['after'] and not p['linear'] else ''
             lines += [pad_between(mark + [seg(G[state] + ' ' + clip(item['title'] + after, w - 22), STATE_COLOUR[state])], [seg(item['word'], 'sub')], w)]
+            if item.get('after'):
+                lines.extend(mark + [seg(line, 'sub')] for line in textwrap.wrap('Waiting on: ' + ', '.join(item['after']), max(10, w - 4)))
             if chosen or full:
                 lines += [mark + [seg(clip(item['action'], w - 3), 'sub')]]
                 lines += [mark + loc_line(G, item.get('loc'))] if item.get('loc') else []
@@ -302,6 +311,8 @@ def section_lines(model, w, selected, full, section):
                 lines += [[seg('  ' + clip(group, w - 3), 'text', bold=True)]]
             suffix = ' - filed ' + item['age'] if section == 2 else ''
             lines += [mark + [seg(clip(item['title'], max(8, w - len(suffix) - 3)) + suffix, 'text')]]
+            if item.get('after'):
+                lines += [mark + [seg(clip('Waiting on: ' + ', '.join(item['after']), w - 3), 'sub')]]
             if section == 3 or chosen or full:
                 prefix = 'Bring back: ' if section == 3 else ''
                 lines += [mark + [seg(clip(prefix + item['action'], w - 3), 'sub')]]
@@ -312,13 +323,23 @@ def section_lines(model, w, selected, full, section):
     return lines, span
 
 
+def moved_line(model, w):
+    items = model.get('just_moved', [])
+    if not items:
+        return []
+    age = max(0, time.time() - items[-1]['at'])
+    item = items[-1 - (int(age // 5) % len(items))]
+    text = 'Just moved: ' + item.get('compact', item['text'])
+    return [[seg(clip(text, w), 'peach')]]
+
+
 def build(model, w, selected, full, section=None):
     """Body lines plus the first and last line of the selected target."""
     if section is not None:
         return section_lines(model, w, selected, full, section)
     G = glyphs()
     targets, span, gap = targets_of(model), (0, 0), ([[]] if full else [])
-    lines = [bar_line(G, model, w), []]
+    lines = [bar_line(G, model, w)] + moved_line(model, w) + [[]]
     need = [t for t in targets if t['kind'] == 'need']
     lines += [heading('Needs you now', 'yellow', f"{len(need)} item" + ('' if len(need) == 1 else 's'), w)] + gap
     if not need:
@@ -326,10 +347,10 @@ def build(model, w, selected, full, section=None):
     for entry in (need if full else need[:SUMMARY_NEED]):
         chosen = targets.index(entry) == selected
         start = len(lines)
-        lines += need_lines(G, model, entry, w, chosen, full or chosen, full) + gap
+        lines += need_lines(G, model, entry, w, chosen, full, full) + gap
         span = (start, len(lines) - 1) if chosen else span
     if len(need) > SUMMARY_NEED and not full:
-        lines.append([seg(f'  +{len(need) - SUMMARY_NEED} more, press f for the full list', 'sub')])
+        lines.append([seg(f'  +{len(need) - SUMMARY_NEED} more, press 1', 'sub')])
     prog = [t for t in targets if t['kind'] == 'prog']
     lines += [[], heading('In motion', 'blue', f"{len(prog)} group" + ('' if len(prog) == 1 else 's'), w)] + gap
     if not prog:
@@ -479,11 +500,12 @@ def run(home, script):
     try:
         while True:
             now = time.monotonic()
-            if os.environ.get('FM_BOARD_DISABLED') != '1' and now - refreshed > 5 and (process is None or process.poll() is not None):
+            if os.environ.get('FM_BOARD_DISABLED') != '1' and now - refreshed > 2 and (process is None or process.poll() is not None):
                 process = subprocess.Popen([str(script / 'fm-board.sh'), 'refresh'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 refreshed = now
             path = Path(home) / 'state/board-model.json'
-            stamp = path.stat().st_mtime_ns if path.exists() else None
+            stamp = tuple(p.stat().st_mtime_ns if p.exists() else None for p in
+                          (path, Path(home) / 'data/board.md'))
             if stamp != mtime:
                 mtime, model = stamp, load_model(home)
             columns, rows = os.get_terminal_size(out.fileno())
@@ -505,7 +527,7 @@ def run(home, script):
                     out.write(f'\x1b[{n + 1};1H{line}\x1b[K')
             out.flush()
             previous = ansi
-            if not select.select([fd], [], [], 1.0)[0]:
+            if not select.select([fd], [], [], 0.2)[0]:
                 continue
             for key in parse_keys(os.read(fd, 64)):
                 targets = targets_of(model, section) if model else []
