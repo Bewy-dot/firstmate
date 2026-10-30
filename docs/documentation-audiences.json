@@ -265,6 +265,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/crew-status.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/herdr-backend.md",
       "audience": "operator-current"
     },

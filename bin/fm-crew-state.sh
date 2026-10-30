@@ -18,6 +18,10 @@
 #
 #   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #
+# Status-log evidence with valid structured terminal fields appends
+# ` · end-state: <JSON object>`; current run-step and busy-pane verdicts never
+# inherit terminal fields from an older event (wire format: fm-brief.sh).
+#
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
 #   2. Matching no-mistakes run for this crew's branch AND current code identity,
@@ -84,6 +88,11 @@ SEP=' · '
 emit() {  # <state> <source> [detail]
   local line="state: $1${SEP}source: $2"
   [ -n "${3:-}" ] && line="$line${SEP}$3"
+  if [ "$2" = status-log ]; then
+    local end_state
+    end_state=$(status_end_state_json "${LOG_LINE:-}")
+    [ "$end_state" = '{}' ] || line="$line${SEP}end-state: $end_state"
+  fi
   printf '%s\n' "$line"
   exit 0
 }

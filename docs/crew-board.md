@@ -2,7 +2,7 @@
 
 Firstmate keeps a terminal board in a persistent pane beside firstmate in Herdr, with `data/board.md` as its plain-text fallback.
 The board is a presentation of the canonical fleet snapshot used by bearings, including structured backlog decisions and each local second mate's own home snapshot.
-It makes no additional GitHub calls and does not authorize an action or change task state.
+It reads cached forge evidence without waiting for network requests and does not authorize an action or change task state.
 
 The existing supervision loop and status-surfacing path refresh the presentation automatically.
 The board viewer also checks for changes between supervision cycles, with a 30-second backstop for CI or secondmate state that changes without a local status event.
@@ -19,17 +19,32 @@ Each live local Herdr worker pane has its task id followed by a state label.
 `HOLDING` means a worker is deliberately awaiting your word to continue.
 `REVIEW` means an open worker question explicitly asks you to review the PR.
 An opened PR or a merge request never implies a review request.
-`CI RUNNING` names the pending check count and, when check start times are available, elapsed time since the earliest pending check started.
-`CI FAILED` names the failing check.
-`CHECKS UNKNOWN` means current check results are unavailable.
-`READY: merge?` requires a fresh successful check rollup and the forge's CLEAN merge status; `READY: apply + merge?` also identifies an unapplied production database change explicitly reported with that evidence.
-Worker prose such as "checks green" is not proof of current CI.
-The recorded PR head and merge-watch sidecar identify a PR but contain no CI verdict.
-The default fleet snapshot and board render make no network calls.
-The opt-in `bin/fm-bearings-snapshot.sh --include-prs --json` path retains the check rollup, check start times, PR head, observation time, and merge status.
-Save that JSON and pass `--pr-snapshot <file>` to a board render or refresh to use it offline.
-Evidence older than five minutes or inconsistent with the recorded head shows checks unknown; a later render without PR evidence also shows checks unknown.
-A missing, empty, or incomplete rollup never claims readiness.
+`CI RUNNING` shows how many required checks have passed out of the total, plus elapsed time since the earliest check started when the forge supplies a start time.
+`CI FAILED` names the failing checks.
+`CI GREEN` means all required checks passed; the action text separately names review, merge, or a production step.
+`MERGED` and `CLOSED` identify terminal PR states, and `no checks configured` means the forge reports no required checks.
+An opened PR never by itself grants merge approval.
+
+Normal renders schedule background reads through GitHub's JSON-capable `gh` interface or the existing `glab` path for GitLab, including self-hosted instances.
+`gh-axi` remains the operator interface; its formatted PR commands do not expose the required machine-readable check fields.
+The PR evidence cache under `state/` is reused for about 60 seconds, including failures.
+Rendering uses stale evidence immediately and marks it as cached while refreshing; the viewer never waits on a forge request.
+A cold cache shows `CI FETCHING` until the background request finishes.
+The refresh worker limits concurrent requests and imposes a short timeout on each CLI process group; exact cache layout and limits belong to `bin/fm_pr_state.py`.
+Completed refreshes invalidate the board fingerprint so the next viewer cycle uses them.
+Fetch failures name the reason, such as GitHub unreachable, no permission, PR not found, missing CLI, or request timed out.
+A GitHub 404 cannot distinguish a missing PR from a private PR hidden by permissions, so that ambiguity is stated explicitly.
+Every recorded task PR and historical status-log PR reference is refreshed, with related PR states in the full action text.
+Pane labels, summary, full board, and Tab views all use the same projection.
+
+Structured terminal status fields are worker-reported evidence, and a current forge result takes precedence when they disagree.
+The reported next action and owner remain visible alongside the check state.
+Legacy status prose still works but cannot prove green CI.
+The status protocol and delivery-specific reporting instructions are owned by `bin/fm-brief.sh`; see [crew status reports](crew-status.md) for supervision behavior.
+The default fleet snapshot remains offline.
+Use `--snapshot <file>` for a completely offline board, optionally enriched with `--pr-snapshot <file>` from `bin/fm-bearings-snapshot.sh --include-prs --json`.
+Offline evidence older than five minutes or inconsistent with the recorded head asks for a refresh with the specific reason; absent evidence says PR checks not fetched (offline snapshot).
+No offline preview starts a fetch or reads the live forge cache.
 `PAUSED` is a declared external wait, `BLOCKED` needs intervention or a current-state check, and `DONE` is completed work.
 A reconciled open worker question takes precedence over delivery readiness; a generic backlog approval flag does not hide a green PR.
 Second mate panes use their reconciled child work to distinguish questions, delivery readiness, deliberate holds, and dependencies.
@@ -125,8 +140,8 @@ If that home cannot be read, the board falls back to the summary and asks for a 
 
 Some harnesses cannot be classified from their pane, so the snapshot reports an unknown state.
 Only in that case, the worker's last status event stands in for it.
-A pause that waits for a merge decision on an open pull request shows its recorded CI state, or checks unknown when CI has not been observed; any other pause shows as a wait rather than a blocker.
-A pull request that the records already show as merged is never offered for review or merge, and its worker shows as done.
+A pause that waits for a merge decision on an open pull request shows its cached CI state, with an explicit fetching or failure reason when CI cannot be read; a pause without a PR shows as a declared external wait.
+A pull request confirmed as merged is never offered for review or merge, and its worker shows as merged.
 
 ## Local group mapping and notes
 

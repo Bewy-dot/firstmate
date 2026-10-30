@@ -172,6 +172,39 @@ status_line_note() {  # <status-line> -> text after the first colon, trimmed
     *) printf '%s' "$1" ;;
   esac
 }
+# Structured terminal evidence. The scaffold in fm-brief.sh owns the wire format.
+# Invalid/partial/duplicate fields remain ordinary legacy prose and return {}.
+status_end_state_json() {  # <status-line> -> JSON object or {}
+  local line=$1 part key value pr='' checks='' next='' owner='' seen='|' valid=1
+  case "$(status_line_verb "$line")" in done|needs-decision|blocked) ;; *) printf '{}'; return ;; esac
+  case "$line" in *' | '*) line=${line#*' | '} ;; *) printf '{}'; return ;; esac
+  while :; do
+    part=${line%%' | '*}
+    key=${part%%=*}; value=${part#*=}
+    case "$seen" in *"|$key|"*) valid=0 ;; esac
+    seen="$seen$key|"
+    case "$key=$value" in
+      pr=none|pr=https://*) pr=$value ;;
+      checks=green|checks=running|checks=failed|checks=none) checks=$value ;;
+      next=merge|next=review|next=prod-apply|next=captain-decision|next=nothing) next=$value ;;
+      owner=captain|owner=firstmate|owner=none) owner=$value ;;
+      *) valid=0 ;;
+    esac
+    case "$line" in *' | '*) line=${line#*' | '} ;; *) break ;; esac
+  done
+  if [ -n "$pr" ] && [ "$pr" != none ]; then
+    # shellcheck source=bin/fm-pr-lib.sh
+    ( . "$_FM_CLASSIFY_LIB_DIR/fm-pr-lib.sh"; fm_pr_url_parse "$pr" ) || valid=0
+  fi
+  if [ "$valid" = 1 ] && [ -n "$pr" ] && [ -n "$checks" ] && [ -n "$next" ] && [ -n "$owner" ] \
+      && [[ "$pr" != *[[:space:]]* ]]; then
+    jq -cn --arg pr "$pr" --arg checks "$checks" --arg next "$next" --arg owner "$owner" \
+      '{pr:$pr,checks:$checks,next:$next,owner:$owner}'
+  else
+    printf '{}'
+  fi
+}
+
 _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
   local prefix=${1%%:*} k
   case "$prefix" in

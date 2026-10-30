@@ -941,6 +941,13 @@ test_no_run_idle_pane_uses_log() {
   out=$(run_crew_state "$d" feat-i)
   assert_contains "$out" "state: done" "ready-for-merge log -> done"
   assert_contains "$out" "source: status-log" "idle merge wait -> status-log source"
+  printf 'done: Shipped login; verified tests | pr=https://github.com/example/repo/pull/1 | checks=green | next=merge | owner=captain\n' > "$d/state/feat-i.status"
+  out=$(run_crew_state "$d" feat-i)
+  assert_contains "$out" 'end-state: {"pr":"https://github.com/example/repo/pull/1","checks":"green","next":"merge","owner":"captain"}' 'structured terminal fields are parsed'
+  printf 'done: Legacy closer | checks=unknown\n' > "$d/state/feat-i.status"
+  out=$(run_crew_state "$d" feat-i)
+  assert_contains "$out" 'state: done' 'malformed fields remain valid legacy status'
+  assert_not_contains "$out" 'end-state:' 'malformed fields must not become evidence'
   pass "no run + idle pane uses the status-log verb"
 }
 

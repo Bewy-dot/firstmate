@@ -132,6 +132,26 @@ EOF
     "mode=ship"
 }
 
+test_structured_terminal_fields() {
+  local home fakebin out
+  home=$(make_home structured-fields)
+  fakebin=$(make_fakebin "$home")
+  mkdir -p "$home/wt"
+  fm_write_meta "$home/state/structured.meta" "window=fm:fm-structured" "worktree=$home/wt" "kind=scout" "harness=claude"
+  record_claude_idle "$home/state" structured
+  printf 'working: Earlier PR https://github.com/example/repo/pull/1\n' > "$home/state/structured.status"
+  printf 'done: Implemented parser; tests passed | pr=https://github.com/example/repo/pull/2 | checks=green | next=merge | owner=captain\n' >> "$home/state/structured.status"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[0] | .current_state.end_state.checks == "green"
+      and .current_state.end_state.next == "merge"
+      and .paths.status_log.last_event.end_state.owner == "captain"
+      and .pr.url == "https://github.com/example/repo/pull/2"
+      and (.pr.references | length) == 2
+  ' >/dev/null || fail "structured end states or PR references missing: $out"
+  pass "snapshot retains reconciled and historical terminal fields and all PR references"
+}
+
 test_empty_fleet_json() {
   local home out view
   home=$(make_home empty)
@@ -779,6 +799,7 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+test_structured_terminal_fields
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
