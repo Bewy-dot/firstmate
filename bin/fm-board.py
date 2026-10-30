@@ -14,6 +14,8 @@ A local second mate's workers and backlog come from that home's own snapshot
 offline), so its children are never read from the parent's bounded summary.
 Besides board.md and board-full.md, every render writes state/board-model.json,
 the structured projection the terminal viewer (fm_board_tui.py) draws.
+--pr-snapshot imports the existing opt-in fm-bearings.v1 candidate_prs evidence
+by exact URL and recorded head, without making any network calls.
 """
 import argparse
 import datetime as dt
@@ -114,7 +116,60 @@ def reported_state(task, url):
     return state, detail, False
 
 
-def task_view(task, titles=None, merged=frozenset()):
+def pr_checks(pr, now=None):
+    """Use recorded forge checks, never worker prose as evidence of green CI.
+
+    check_runs and merge_state are retained by the opt-in bearings PR path.
+    CLEAN plus a nonempty successful rollup establishes passing merge checks;
+    an empty/missing rollup, an old observation, or a head mismatch stays unknown.
+    """
+    unknown = ('CHECKS UNKNOWN', SECTIONS[0], 'Checks unknown; no current PR check result is recorded')
+    if not pr or not pr.get('url'):
+        return None
+    if pr.get('head_mismatch'):
+        return unknown
+    try:
+        observed = dt.datetime.fromisoformat(pr['observed_at'].replace('Z', '+00:00'))
+        if now and not 0 <= (now - observed).total_seconds() <= 300:
+            return unknown
+    except (KeyError, TypeError, ValueError):
+        return unknown
+    checks = pr.get('check_runs')
+    if not isinstance(checks, list) or not checks:
+        return unknown
+    failed, pending, other = [], [], []
+    for check in checks:
+        state = str(check.get('conclusion') or check.get('state') or check.get('status') or '').upper()
+        if state in ('FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'):
+            failed.append(plain(check.get('name') or check.get('context') or 'unnamed check'))
+        elif state in ('QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING', 'REQUESTED', 'EXPECTED'):
+            pending.append(check)
+        elif state not in ('SUCCESS', 'NEUTRAL', 'SKIPPED'):
+            other.append(check)
+    if failed:
+        names = ', '.join(failed)
+        return 'CI FAILED: ' + short(names, 48), SECTIONS[0], 'CI failed: ' + names
+    if pending:
+        age = ''
+        starts = []
+        for check in pending:
+            try:
+                started = dt.datetime.fromisoformat(check['startedAt'].replace('Z', '+00:00'))
+                if now and started <= now and started.year > 1970:
+                    starts.append(started)
+            except (KeyError, TypeError, ValueError):
+                pass
+        if starts:
+            minutes = int((now - min(starts)).total_seconds() // 60)
+            age = ', ' + (str(minutes) + 'm elapsed' if minutes else 'under 1m elapsed')
+        label = 'CI RUNNING: ' + str(len(pending)) + ' pending' + age
+        return label, SECTIONS[1], label
+    if not other and pr.get('merge_state') == 'CLEAN':
+        return 'READY: merge?', SECTIONS[0], 'Give the merge word'
+    return unknown
+
+
+def task_view(task, titles=None, merged=frozenset(), now=None):
     backlog = task.get('backlog') or {}
     decisions = task.get('hints', {}).get('open_decisions', [])
     url = (task.get('pr') or {}).get('url') or backlog.get('pr_url')
@@ -122,23 +177,27 @@ def task_view(task, titles=None, merged=frozenset()):
     if backlog.get('state') == 'done':
         return 'DONE', SECTIONS[2], 'Completed'
     questions = [d for d in decisions if d.get('verb') == 'needs-decision']
-    green = state == 'done' and url and re.search(r'checks green|checks.passed|CI checks passed', detail, re.I)
+    checks = pr_checks(dict(task.get('pr') or {}, url=url), now)
+    green = checks and checks[0].startswith('READY:')
     delivery_only = questions and all(re.search(MERGE_WORD, plain(d.get('summary')), re.I) for d in questions)
-    if questions and not (green and delivery_only):
+    review_asked = any(re.search(r'\breview\b.*\bPR\b|\bPR\b.*\breview\b', plain(d.get('summary')), re.I) for d in questions)
+    if questions and not delivery_only and not review_asked:
         return 'NEEDS ANSWER', SECTIONS[0], '; '.join(plain(d['summary']) for d in questions)
     if url in merged and state in ('done', 'paused', 'unknown'):
         return 'DONE', SECTIONS[2], 'Merged'
+    if checks and checks[0].startswith(('CI RUNNING', 'CI FAILED')):
+        return checks
     if state == 'failed':
         return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
-    if state == 'done' and url:
+    if url and review_asked:
+        return 'REVIEW', SECTIONS[0], 'Review the PR; ' + ('checks green' if green else 'checks unknown')
+    if url and state in ('done', 'paused', 'unknown'):
         if green:
             release_note = detail + ' ' + plain(task.get('paths', {}).get('status_log', {}).get('last_event', {}).get('note'))
             apply = re.search(r'apply.*(?:database|migration)|(?:database|migration).*(?:must|needs?|awaiting|pending|before merge|to be applied)', release_note, re.I) and not re.search(r'already applied|has been applied', release_note, re.I)
             return ('READY: apply + merge?' if apply else 'READY: merge?', SECTIONS[0],
                     'Apply the production database change, then give the merge word' if apply else 'Give the merge word')
-        if inferred:
-            return 'REVIEW', SECTIONS[0], 'Worker is waiting for your merge decision; green checks not confirmed'
-        return 'REVIEW', SECTIONS[0], 'Review the PR; green checks have not been confirmed'
+        return checks
     blockers = backlog.get('unresolved_blocker_ids') or []
     if blockers:
         names = ', '.join((titles or {}).get(key, key) for key in blockers)
@@ -151,6 +210,8 @@ def task_view(task, titles=None, merged=frozenset()):
         return 'BLOCKED', SECTIONS[0], detail or 'Help the worker unblock'
     if state == 'done':
         return 'DONE', SECTIONS[2], detail or 'Completed'
+    if state == 'working' and url:
+        return 'WORKING', SECTIONS[1], (detail or 'Worker running') + ('; PR checks green' if green else '; PR checks unknown')
     if state == 'working':
         return ('CI RUNNING' if re.search(r'\bci (running|pending)\b', detail, re.I) else 'WORKING', SECTIONS[1], detail or 'Worker running')
     return 'BLOCKED', SECTIONS[0], 'Check worker state: ' + (detail or 'current state unavailable')
@@ -228,7 +289,7 @@ def project(snapshot, rules, homes=None):
             record = dict(task.get('backlog') or {})
             record.update(id=task['id'], project=task.get('project'))
             record.setdefault('title', task['id'])
-            label, section, action = task_view(task, titles, merged)
+            label, section, action = task_view(task, titles, merged, now)
             endpoint = local_endpoint(task)
             if endpoint and sink is not None:
                 sink.append(dict(id=task['id'], target=endpoint, label=label))
@@ -256,7 +317,7 @@ def project(snapshot, rules, homes=None):
                     'Check worker: summary incomplete or unavailable')
         # A broad owner state cannot distinguish a question, merge, or designed
         # hold. Use the same child classifier as the board, including precedence.
-        priority = ('BLOCKED', 'CHECK', 'NEEDS ANSWER', 'READY:', 'REVIEW', 'HOLDING', 'WORKING', 'CI RUNNING', 'WAITING:', 'PAUSED')
+        priority = ('CI FAILED', 'BLOCKED', 'CHECKS UNKNOWN', 'CHECK', 'NEEDS ANSWER', 'READY:', 'REVIEW', 'HOLDING', 'WORKING', 'CI RUNNING', 'WAITING:', 'PAUSED')
         label = next((value for prefix in priority for value in owner_labels if value.startswith(prefix)), 'DONE')
         if incomplete or label == 'CHECK':
             label = 'BLOCKED'
@@ -490,8 +551,10 @@ def style_of(row):
     """Presentation tone, badge text, and icon name for a needs-you row."""
     label = row['label']
     if label == 'BLOCKED' and row['failed']:
-        return 'red', 'Failed', 'fail'
-    for prefix, style in (('READY: apply', ('peach', 'Database, then merge', 'db')),
+        return 'peach', 'Failed', 'fail'
+    for prefix, style in (('CI FAILED', ('peach', 'CI failed', 'fail')),
+                          ('CHECKS UNKNOWN', ('peach', 'Checks unknown', 'eye')),
+                          ('READY: apply', ('peach', 'Database, then merge', 'db')),
                           ('READY:', ('green', 'Ready to merge', 'merge')),
                           ('NEEDS ANSWER', ('yellow', 'Question for you', 'ask')),
                           ('REVIEW', ('yellow', 'Review the PR', 'eye')),
@@ -507,8 +570,12 @@ def step_state(row):
     label = row['label']
     if row['section'] in (SECTIONS[2], 'Completed prerequisites'):
         return 'done', 'done'
-    if label in ('WORKING', 'CI RUNNING'):
-        return 'run', 'checks running' if label == 'CI RUNNING' else 'running'
+    if label == 'WORKING' or label.startswith('CI RUNNING'):
+        return 'run', label.removeprefix('CI RUNNING: ') if label.startswith('CI RUNNING:') else 'checks running' if label == 'CI RUNNING' else 'running'
+    if label.startswith('CI FAILED'):
+        return 'fail', 'CI failed'
+    if label == 'CHECKS UNKNOWN':
+        return 'need', 'checks unknown'
     if row['section'] == SECTIONS[0]:
         return ('fail', 'failed') if row['failed'] else ('need', 'stuck' if label in ('BLOCKED', 'CHECK') else 'needs you')
     if label == 'QUEUED':
@@ -577,13 +644,29 @@ def build_model(rows, components, counts, programme_names, now, snapshot, merged
                 by[label] = by.get(label, 0) + 1
         return [list(item) for item in sorted(by.items(), key=lambda kv: -kv[1])]
 
+    def entries(section):
+        result = []
+        for row in rows:
+            if row['section'] != section:
+                continue
+            name = programme_names.get((row['scope'], row['record']['id']), row['category'])
+            since = row['record'].get('since')
+            try:
+                days = max(0, (now.date() - dt.date.fromisoformat(since[:10])).days)
+                age = 'today' if days == 0 else str(days) + 'd ago'
+            except (TypeError, ValueError):
+                age = 'date unknown'
+            result.append(dict(common(row), programme=row['group'] + (' / ' + name if name else ''),
+                               age=age, detail=str(Path(snapshot.get('fm_home') or '.') / 'data/board-full.md')))
+        return sorted(result, key=lambda item: item['programme'])
+
     done = [dict(title=short(r['record'].get('title') or r['record']['id'], 64), group=r['group'],
                  prs=[dict(label=pr_label(u), url=u) for u in pr_links(r)])
             for r in rows if r['section'] == SECTIONS[2]]
     return dict(schema='fm-board-model.v1', generated=snapshot['generated'], home=snapshot.get('fm_home'),
                 counts=dict(need=counts[SECTIONS[0]], moving=counts[SECTIONS[1]], queued=counts[SECTIONS[4]],
                             parked=counts[SECTIONS[3]], done=counts[SECTIONS[2]]),
-                need=need, programmes=programmes,
+                need=need, programmes=programmes, queued=entries(SECTIONS[4]), parked=entries(SECTIONS[3]),
                 quiet=dict(queued=tally(SECTIONS[4]), parked=tally(SECTIONS[3]), done=done),
                 notice='Worker records need attention; check the fleet status report.'
                 if snapshot.get('main_inventory', {}).get('valid') is False else '')
@@ -702,7 +785,7 @@ def refresh(args, home):
             return
         signature = fingerprint(home)
         cache = state / 'board-refresh.json'
-        if args.command == 'refresh' and not args.snapshot and cache.exists():
+        if args.command == 'refresh' and not args.snapshot and not args.pr_snapshot and cache.exists():
             prior = json.loads(cache.read_text())
             if prior.get('signature') == signature and time.time() - prior.get('time', 0) < 30:
                 return
@@ -710,7 +793,21 @@ def refresh(args, home):
         snapshot = json.loads(Path(args.snapshot).read_text()) if args.snapshot else json.loads(subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--json'], text=True, timeout=180))
         if snapshot.get('schema') != 'fm-fleet-snapshot.v1':
             raise ValueError('expected fm-fleet-snapshot.v1')
-        generated, full, labels, model = project(snapshot, rules, home_snapshots(args, snapshot))
+        snapshot.setdefault('fm_home', str(home))
+        homes = home_snapshots(args, snapshot)
+        if args.pr_snapshot:
+            evidence = json.loads(Path(args.pr_snapshot).read_text())
+            if evidence.get('schema') != 'fm-bearings.v1':
+                raise ValueError('expected fm-bearings.v1 PR snapshot')
+            by_url = {p['url']: p for p in evidence.get('candidate_prs', [])}
+            for task in [task for snap in [snapshot, *homes.values()] for task in snap.get('tasks', [])]:
+                recorded = task.get('pr') or {}
+                live = by_url.get(recorded.get('url'))
+                if live:
+                    task['pr'] = dict(recorded, **{k: live[k] for k in ('check_runs', 'merge_state', 'observed_at') if k in live},
+                                      head_mismatch=bool(recorded.get('head') and recorded['head'] != live.get('head')))
+
+        generated, full, labels, model = project(snapshot, rules, homes)
         write_board(home / 'data/board-full.md', full)
         write_board(home / 'data/board.md', generated)
         write_atomic(state / 'board-model.json', json.dumps(model, indent=1) + '\n')
@@ -745,7 +842,7 @@ def home_snapshots(args, snapshot):
 def view(home, args):
     import fm_board_tui
     if args.once:
-        fm_board_tui.once(home, args.width, args.height, args.select, args.detail)
+        fm_board_tui.once(home, args.width, args.height, args.select, args.detail, args.section)
     else:
         fm_board_tui.run(home, SCRIPT)
 
@@ -758,6 +855,8 @@ def main():
     parser.add_argument('--height', type=int, default=0, help='view --once: rows; 0 means the natural height')
     parser.add_argument('--select', type=int, default=0)
     parser.add_argument('--detail', action='store_true', help='view --once: full detail instead of the summary')
+    parser.add_argument('--section', type=int, choices=range(1, 5), help='view --once: section 1 to 4; omitted means the compact summary')
+    parser.add_argument('--pr-snapshot', help='render/refresh: offline fm-bearings.v1 from the opt-in --include-prs path')
     parser.add_argument('--snapshot')
     parser.add_argument('--home-snapshot', action='append', metavar='ID=FILE')
     args = parser.parse_args()

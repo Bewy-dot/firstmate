@@ -17,9 +17,19 @@ Each live local Herdr worker pane has its task id followed by a state label.
 `NEEDS ANSWER` is reserved for an actual open worker question.
 `WAITING: <earlier task>` names an unresolved prerequisite rather than claiming the worker is implementing.
 `HOLDING` means a worker is deliberately awaiting your word to continue.
-`REVIEW` asks for PR review when green checks have not been confirmed.
-`READY: merge?` requires reconciled green-check evidence; `READY: apply + merge?` also identifies an unapplied production database change explicitly reported with that evidence.
-An opened PR alone never claims green checks.
+`REVIEW` means an open worker question explicitly asks you to review the PR.
+An opened PR or a merge request never implies a review request.
+`CI RUNNING` names the pending check count and, when check start times are available, elapsed time since the earliest pending check started.
+`CI FAILED` names the failing check.
+`CHECKS UNKNOWN` means current check results are unavailable.
+`READY: merge?` requires a fresh successful check rollup and the forge's CLEAN merge status; `READY: apply + merge?` also identifies an unapplied production database change explicitly reported with that evidence.
+Worker prose such as "checks green" is not proof of current CI.
+The recorded PR head and merge-watch sidecar identify a PR but contain no CI verdict.
+The default fleet snapshot and board render make no network calls.
+The opt-in `bin/fm-bearings-snapshot.sh --include-prs --json` path retains the check rollup, check start times, PR head, observation time, and merge status.
+Save that JSON and pass `--pr-snapshot <file>` to a board render or refresh to use it offline.
+Evidence older than five minutes or inconsistent with the recorded head shows checks unknown; a later render without PR evidence also shows checks unknown.
+A missing, empty, or incomplete rollup never claims readiness.
 `PAUSED` is a declared external wait, `BLOCKED` needs intervention or a current-state check, and `DONE` is completed work.
 A reconciled open worker question takes precedence over delivery readiness; a generic backlog approval flag does not hide a green PR.
 Second mate panes use their reconciled child work to distinguish questions, delivery readiness, deliberate holds, and dependencies.
@@ -58,12 +68,14 @@ The compact summary shows one PR URL per group and counts any additional PRs in 
 The pane draws `state/board-model.json`, the structured projection written by every render, in the colours of a Catppuccin Mocha terminal.
 Pills like the Herdr and WezTerm tab bar carry the counts and each item's kind, and the default view stays within 34 lines whatever the inventory.
 Yellow and peach mean the item needs you, green means ready to merge or done, blue means running, and grey means waiting, queued, or parked.
-Mauve marks links and the selected item, and red appears only for a genuine failure.
+Mauve marks links and the selected item, and peach also marks a failure with an explicit Failed label.
 Every state also has a word and an icon, so colour is never the only signal.
 
 The default view shows up to five items that need you, with the selected one expanded to its question, links, and pane location.
 Below them, each group in motion is one line with its dependency chain drawn as connected icons, then three summary lines for queued decisions, parked work, and recent completions.
 `f` switches to the full view, where every item is expanded and every chain is drawn as a vertical rail with dashed connectors for waiting steps.
+
+![Queued decisions grouped by programme, with filing age and keyboard selection](images/crew-board-queued.png)
 
 Keys:
 
@@ -71,11 +83,16 @@ Keys:
 - Enter goes to the selected worker's pane.
 - `o` opens its pull request, or its brief when it has none.
 - `b` opens the brief, and `r` opens the report.
+- Tab cycles Needs you now, In motion, Queued, and Parked; Shift-Tab goes back, and `1` to `4` jump directly.
+- The active header pill has a `>` marker, and the last section is remembered across viewer restarts in the same terminal session.
+- In motion lists selectable dependency steps with their state and pane location; Queued lists filed decisions and their age by programme, and Parked shows each bring-back trigger.
+- Queued means filed and not yet asked; nobody is blocked by a queued decision.
+- Enter on a queued decision or parked item opens its detail file; `b` and `r` open its brief and report when present.
 - `f` switches between the summary and the full view, and `q` exits.
 
 PR, brief, report, and detail links are also OSC 8 hyperlinks, so a terminal that supports them can click through.
 A brief, report, or detail file inside an Obsidian vault opens as an `obsidian://open?vault=<folder name>&file=<path>` link, found from the nearest `.obsidian` folder above the file; any other file opens directly.
-`bin/fm-board.sh view --once --width 60` prints one frame and exits, and `--select N` and `--detail` choose the selection and the full view.
+`bin/fm-board.sh view --once --width 60` prints one frame and exits, and `--select N`, `--detail`, and `--section 1` to `--section 4` choose the selection, full view, and section.
 
 Glyphs use Nerd Font powerline and icon characters, which WezTerm bundles.
 Set `FM_BOARD_ICONS=plain`, or put `plain` in `config/board-icons`, for plain Unicode on a terminal without that font.
@@ -108,7 +125,7 @@ If that home cannot be read, the board falls back to the summary and asks for a 
 
 Some harnesses cannot be classified from their pane, so the snapshot reports an unknown state.
 Only in that case, the worker's last status event stands in for it.
-A pause that waits for a merge decision on an open pull request shows as a review request with green checks unconfirmed, and any other pause shows as a wait rather than a blocker.
+A pause that waits for a merge decision on an open pull request shows its recorded CI state, or checks unknown when CI has not been observed; any other pause shows as a wait rather than a blocker.
 A pull request that the records already show as merged is never offered for review or merge, and its worker shows as done.
 
 ## Local group mapping and notes

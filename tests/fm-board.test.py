@@ -18,6 +18,11 @@ import urllib.parse
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def green_pr(url):
+    return dict(url=url, observed_at='2026-10-30T08:00:00Z', merge_state='CLEAN',
+                check_runs=[dict(name='tests', status='COMPLETED', conclusion='SUCCESS')])
+
+
 def fixture():
     def task(name, repo, state, detail='', **kw):
         row = dict(id=name, kind='ship', project=repo, backend='herdr',
@@ -42,13 +47,13 @@ def fixture():
                          hints=dict(open_decisions=[dict(verb='needs-decision', summary='Should allowances count toward compensation?')])),
                     task('multi-firm-programme', 'continuo', 'working', 'Implement firm switching'),
                     task('cadenza-ci', 'cadenza', 'working', 'ci running'),
-                    task('database-release', 'isp', 'done', 'checks green; apply production database migration before merge', pr=dict(url=url+'isp/pull/1')),
-                    task('merge-ready', 'aaa', 'done', 'checks green: PR ready for review', pr=dict(url=url+'aaa/pull/2')),
-                    task('review-first', 'mca-website', 'done', 'PR opened', pr=dict(url=url+'mca-website/pull/3')),
+                    task('database-release', 'isp', 'done', 'checks green; apply production database migration before merge', pr=green_pr(url+'isp/pull/1')),
+                    task('merge-ready', 'aaa', 'done', 'checks green: PR ready for review', pr=green_pr(url+'aaa/pull/2')),
+                    task('review-first', 'mca-website', 'done', 'PR opened', pr=dict(url=url+'mca-website/pull/3'), hints=dict(open_decisions=[dict(verb='needs-decision', summary='Please review the PR')])),
                     task('external-release', 'firstmate', 'paused', 'Resume after upstream version 2 is released'),
                     task('build-failed', 'firstmate', 'failed', 'Review the build failure'),
                     task('unknown-task', 'misc', 'unknown'),
-                    task('already-applied', 'isp', 'done', 'checks green; database migration already applied', pr=dict(url=url+'isp/pull/4'))])
+                    task('already-applied', 'isp', 'done', 'checks green; database migration already applied', pr=green_pr(url+'isp/pull/4'))])
 
 
 def sequence_fixture():
@@ -61,7 +66,7 @@ def sequence_fixture():
         hold_reason='Choose the legal option ' + str(n)) for n in range(80)]
     for name, title, blockers, state, detail, extra in [
         ('billing', 'Recurring billing', [], 'done', 'checks green',
-         dict(pr=dict(url='https://github.com/example/continuo/pull/101'))),
+         dict(pr=green_pr('https://github.com/example/continuo/pull/101'))),
         ('fees', 'Fee schedule', ['billing'], 'working', 'Implementing', {}),
         ('proposals', 'Plan proposals', ['fees'], 'working', 'Implementing', {}),
         ('rollout', 'Plan rollout', [], 'blocked', 'Waiting for captain word', {})]:
@@ -86,6 +91,8 @@ class Board(unittest.TestCase):
         (self.home / 'config').mkdir()
         self.path = self.home / 'snapshot.json'
         self.env = dict(os.environ, FM_HOME=str(self.home), FM_BOARD_DISABLED='0', FM_BACKEND='tmux')
+        self.env.pop('NO_COLOR', None)
+        self.env.pop('FM_BOARD_ICONS', None)
         self.snap = fixture()
 
     def run_board(self, command='render', check=True):
@@ -187,7 +194,7 @@ class Board(unittest.TestCase):
                 endpoints=[dict(id='ready', title='Ready change', repo='isp', state='done',
                     detail='checks green', pr_url='https://github.com/example/isp/pull/42')])]))
         self.run_board()
-        self.assertIn('Ready change [READY: merge?]', self.board())
+        self.assertIn('Ready change [CHECKS UNKNOWN]', self.board())
         self.assertNotIn('Choose pilot', self.board())
         self.assertIn('Choose pilot [QUEUED]', self.full())
         self.assertEqual(self.full().count('Ready change ['), 1)
@@ -274,12 +281,12 @@ class Board(unittest.TestCase):
         self.assertNotIn('38;2', mono_raw)
         self.assertNotIn('48;2', mono_raw)
 
-    def test_failure_is_the_only_red(self):
+    def test_failure_uses_peach_and_a_word(self):
         self.snap['tasks'] = [t for t in self.snap['tasks'] if t['id'] == 'build-failed']
         self.snap['tasks'][0]['current_state'] = dict(state='failed', detail='Build failed')
         self.run_board()
         raw, text = self.frame('--width', '70')
-        self.assertIn('243;139;168', raw)
+        self.assertNotIn('243;139;168', raw)
         self.assertIn('Failed', text)
 
     def test_second_mate_home_is_authoritative_and_merged_prs_are_dropped(self):
@@ -295,7 +302,7 @@ class Board(unittest.TestCase):
                          secondmate_landed=dict(records=[dict(id='q4', title='Queue Q4', repo='isp', owner='mate', pr_url=merged,
                                                               completion=dict(verb='merged', date='2026-10-29'))]))
         self.run_board()
-        self.assertIn('Queue dashboard [BLOCKED]', self.full())  # the bounded summary alone misreads it
+        self.assertIn('Queue dashboard [CHECKS UNKNOWN]', self.full())  # the bounded summary alone misreads it
         def codex(name, pr, event, note):
             return dict(id=name, kind='ship', project='isp', backend='herdr', endpoint=dict(target='lab:w3:p9', exists=True),
                         backlog=dict(id=name, title='Worker ' + name, repo='isp'), pr=dict(url=pr),
@@ -314,8 +321,8 @@ class Board(unittest.TestCase):
         self.assertNotIn('Worker status', full)
         self.assertNotIn('BLOCKED', board)
         needs = board.split('## NEEDS YOU NOW')[1].split('## Running')[0]
-        self.assertIn('Worker q6 [REVIEW]', needs)
-        self.assertIn('waiting for your merge decision', needs)
+        self.assertIn('Worker q6 [CHECKS UNKNOWN]', needs)
+        self.assertIn('Checks unknown', needs)
         self.assertIn(live, needs)
         self.assertNotIn(merged, board)  # a merged PR is never offered
         self.assertNotIn('switch', needs)  # a deliberate wait is not a request for you
@@ -413,6 +420,129 @@ class Board(unittest.TestCase):
         until('1049l')
         self.assertEqual(process.wait(timeout=5), 0)
 
+    def test_section_frames_at_half_width(self):
+        self.snap = sequence_fixture()
+        self.snap['tasks'].append(fixture()['tasks'][6])
+        self.run_board()
+        for section, expected in [(1, 'Needs you now'), (2, 'Fee schedule'),
+                                  (3, 'Nobody is blocked'), (4, 'Bring back:')]:
+            raw, text = self.frame('--section', str(section), '--width', '60', '--height', '34')
+            self.assertIn(expected, text)
+            self.assertIn('Tab', text)
+            self.assertIn('next section', text)
+            self.assertLessEqual(max(map(len, text.splitlines())), 60)
+            self.assertEqual(len(text.splitlines()), 34)
+            self.assertNotIn('243;139;168', raw)
+        _, text = self.frame('--section', '3', '--select', '79', '--width', '60', '--height', '34')
+        self.assertIn('79', text)
+        self.assertTrue('3Q:80' in text.splitlines()[0] or '>3 Queued 80' in text.splitlines()[0])
+
+    def test_section_keys_and_restart(self):
+        self.snap['fm_home'] = str(self.home)
+        self.snap['backlog']['records'][0]['since'] = '2026-10-28'
+        for name in ('brief', 'report'):
+            path = self.home / ('data/onboarding-review/' + name + '.md')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name)
+        recorder = self.home / 'record-open'
+        recorder.write_text('#!/bin/sh\necho "$*" >> "' + str(self.home / 'opened.log') + '"\n')
+        recorder.chmod(0o700)
+        self.env['FM_BOARD_OPEN'] = str(recorder)
+        self.run_board()
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 34, 60, 0, 0))
+        saved_terminal = termios.tcgetattr(slave)
+        env = dict(self.env, FM_BOARD_DISABLED='1', HERDR_SESSION='fixture-session')
+        def launch():
+            p = subprocess.Popen([sys.executable, str(ROOT / 'bin/fm-board.py'), 'view'],
+                                 stdin=slave, stdout=slave, stderr=slave, env=env)
+            def cleanup():
+                if p.poll() is None:
+                    p.kill()
+                p.wait()
+            self.addCleanup(cleanup)
+            return p
+        def read_frame(token=None):
+            data = b''
+            deadline = time.monotonic() + (5 if token else 0.2)
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.03)[0]:
+                    data += os.read(master, 65536)
+                    if token and token.encode() in data:
+                        break
+            return data.decode(errors='replace')
+        def quit_viewer(p):
+            os.write(master, b'q')
+            # TCSADRAIN restores the terminal only after queued output is read.
+            # Waiting on the process without draining its PTY deadlocks on macOS.
+            data = b''
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.03)[0]:
+                    data += os.read(master, 65536)
+                if p.poll() is not None:
+                    while select.select([master], [], [], 0)[0]:
+                        data += os.read(master, 65536)
+                    break
+            self.assertIsNotNone(p.poll(), 'Viewer did not exit while its PTY was being drained')
+            self.assertEqual(p.wait(timeout=0.1), 0)
+            self.assertIn(b'\x1b[?25h\x1b[?1049l', data)
+            restored = termios.tcgetattr(slave)
+            # macOS sets PENDIN while switching back to canonical input.
+            # It is kernel queue bookkeeping, not an unrestored terminal mode.
+            restored[3] &= ~getattr(termios, 'PENDIN', 0)
+            expected_terminal = list(saved_terminal)
+            expected_terminal[3] &= ~getattr(termios, 'PENDIN', 0)
+            self.assertEqual(restored, expected_terminal)
+
+        p = launch()
+        self.assertIn('Needs you now', read_frame('Needs you now'))
+        for key, expected, token in [
+            (b'\t', 1, 'In motion'), (b'\t', 2, 'Nobody is blocked'),
+            (b'\t', 3, 'Bring back:'), (b'\t', 0, 'Needs you now'),
+            (b'\x1b[Z', 3, 'Bring back:'), (b'1', 0, 'Needs you now'),
+            (b'2', 1, 'In motion'), (b'3', 2, '2d ago'), (b'4', 3, 'Bring back:')]:
+            read_frame()  # Drain the previous frame before checking this key.
+            os.write(master, key)
+            deadline = time.monotonic() + 5
+            preference = self.home / 'state/board-view.json'
+            while time.monotonic() < deadline:
+                try:
+                    if json.loads(preference.read_text())['section'] == expected:
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.01)
+            text = read_frame(token)
+            self.assertIn(token, text)
+            pref = json.loads((self.home / 'state/board-view.json').read_text())
+            self.assertEqual(pref['section'], expected)
+        os.write(master, b'3')
+        read_frame('Nobody is blocked')
+        for key, label in [(b'b', 'Brief'), (b'r', 'Report'), (b'\r', 'Detail')]:
+            os.write(master, key)
+            self.assertIn('Opened ' + label, read_frame('Opened ' + label))
+        opened = (self.home / 'opened.log').read_text()
+        self.assertIn('onboarding-review/brief.md', opened)
+        self.assertIn('onboarding-review/report.md', opened)
+        self.assertIn('board-full.md', opened)
+        os.write(master, b'4')
+        read_frame('Bring back:')
+        quit_viewer(p)
+        p = launch()
+        self.assertIn('Bring back:', read_frame('Bring back:'))
+        # Live model updates preserve the section and render its empty state.
+        model_path = self.home / 'state/board-model.json'
+        model = json.loads(model_path.read_text())
+        model['queued'] = []
+        model['counts']['queued'] = 0
+        model_path.write_text(json.dumps(model))
+        os.write(master, b'3')
+        self.assertIn('Nothing queued', read_frame('Nothing queued'))
+        quit_viewer(p)
+
     def test_groups_actions_history_and_notes(self):
         self.run_board()
         text = self.full()
@@ -421,7 +551,7 @@ class Board(unittest.TestCase):
                          '## Cadenza', '## ISP', '## AAA', '## MCA website', '## Firstmate', '## Other',
                          'Should allowances count toward compensation?',
                          'Apply the production database change, then give the merge word',
-                         'Give the merge word', 'Review the PR; green checks have not been confirmed',
+                         'Give the merge word', 'Review the PR; checks unknown',
                          'Resume after upstream version 2 is released', 'Login repair',
                          'https://github.com/example/cadenza/pull/9',
                          'https://github.com/example/isp/pull/1']:
@@ -479,6 +609,56 @@ class Board(unittest.TestCase):
         task['paths'] = dict(status_log=dict(last_event=dict(note='Apply production database migration before merge')))
         self.run_board()
         self.assertIn('Apply the production database change, then give the merge word', self.full())
+
+    def test_pr_checks_running_failed_green_and_unknown(self):
+        url = 'https://github.com/example/isp/pull/1'
+        base = self.snap['tasks'][3]
+        self.snap['backlog']['records'] = []
+        self.snap['tasks'] = [base]
+        cases = [
+            (dict(green_pr(url), check_runs=[
+                dict(name='tests', status='IN_PROGRESS', startedAt='2026-10-30T07:53:00Z'),
+                dict(name='lint', state='PENDING')]), 'CI RUNNING: 2 pending, 7m elapsed'),
+            (dict(green_pr(url), check_runs=[dict(name='lint', status='COMPLETED', conclusion='FAILURE')]), 'CI FAILED: lint'),
+            (green_pr(url), 'READY: apply + merge?'),
+            (dict(url=url), 'CHECKS UNKNOWN'),
+            (dict(green_pr(url), merge_state='BLOCKED'), 'CHECKS UNKNOWN'),
+            (dict(green_pr(url), check_runs=[]), 'CHECKS UNKNOWN'),
+            (dict(green_pr(url), observed_at='2026-10-30T07:00:00Z'), 'CHECKS UNKNOWN')]
+        for pr, label in cases:
+            with self.subTest(label=label, pr=pr):
+                base['pr'] = pr
+                self.run_board()
+                self.assertIn('[' + label + ']', self.full())
+                self.assertNotIn('Review the PR', self.full())
+                model = json.loads((self.home / 'state/board-model.json').read_text())
+                labels = [i['label'] for i in model['need']] + [s['label'] for p in model['programmes'] for s in p['steps']]
+                self.assertIn(label, labels)
+        base['hints'] = dict(open_decisions=[dict(verb='needs-decision', summary='Please review the PR')])
+        base['pr'] = cases[0][0]
+        self.run_board()
+        self.assertIn('CI RUNNING: 2 pending', self.full())
+        self.assertNotIn('Review the PR', self.full())
+        base['pr'] = dict(url=url)
+        self.run_board()
+        self.assertIn('Review the PR; checks unknown', self.full())
+
+    def test_offline_pr_enrichment_matches_url_and_head(self):
+        url = 'https://github.com/example/isp/pull/1'
+        task = self.snap['tasks'][3]
+        task['pr'] = dict(url=url, head='current')
+        self.snap['tasks'] = [task]
+        evidence = self.home / 'prs.json'
+        evidence.write_text(json.dumps(dict(schema='fm-bearings.v1', candidate_prs=[dict(green_pr(url), head='current')])))
+        self.path.write_text(json.dumps(self.snap))
+        cmd = [str(ROOT / 'bin/fm-board.sh'), 'render', '--snapshot', str(self.path), '--pr-snapshot', str(evidence)]
+        subprocess.run(cmd, env=self.env, check=True, capture_output=True)
+        self.assertIn('READY: apply + merge?', self.full())
+        task['pr']['head'] = 'new-commit'
+        self.path.write_text(json.dumps(self.snap))
+        subprocess.run(cmd, env=self.env, check=True, capture_output=True)
+        self.assertIn('CHECKS UNKNOWN', self.full())
+        self.assertNotIn('READY:', self.full())
 
     def test_real_canonical_snapshot_backlog(self):
         (self.home / 'data').mkdir()
