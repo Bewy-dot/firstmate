@@ -13,6 +13,10 @@ The `hold` subcommand maps an originating work id and stable decision key to `<o
 It creates a kind `captain` backlog item when absent and invokes `tasks-axi hold <id> --reason <reason> --kind captain` on every retry.
 It rejects an identity collision, a changed title, and attempts to reopen an already resolved identity.
 
+The `ask` subcommand records that an active hold has actually been put to the captain, preserving the first timestamp and optional question on idempotent retry.
+Its exact command syntax, marker format, atomic writes, and locking are owned by `bin/fm-decision-hold.sh --help`.
+The board distinguishes asked questions from merely filed decisions through the canonical snapshot; this marker conveys presentation state and grants no new authority.
+
 The `complete` subcommand unions the reviewed keys into `decision_keys=` and appends `decisions_reviewed=1` while originating task metadata is live.
 A post-teardown visual review can complete against the surviving report and durable holds without recreating volatile task metadata.
 It accepts `--none` as an explicit semantic inventory result, not as inferred absence.
@@ -26,7 +30,8 @@ The `--force` path remains the explicit captain-approved discard escape hatch.
 The `resolve` subcommand requires a decision file and at least one existing dependent task whose structured `blocked-by` edge points to the hold.
 It records the decision digest and routed task identities as a retry identity in the hold body, clears each dependency edge through tasks-axi, and marks the hold Done only after those writes succeed.
 An exact retry can finish a partial routing operation, while a changed decision or routed-task set is rejected.
-A failed intermediate step leaves the hold open.
+A failed intermediate step leaves the hold open and preserves its asked marker.
+Successful closure or an exact verified resolution retry clears the marker.
 
 ## Structured read surfaces
 

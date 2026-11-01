@@ -2,7 +2,8 @@
 """Nonblocking board PR evidence, never task or merge authority.
 
 Cache: state/board-pr-cache/<sha256(url)>.json, atomic private JSON records keyed
-by exact canonical URL. TTL is 60 seconds, including failures; stale entries are
+by exact canonical URL. Open PR TTL is five seconds; failures wait 60 seconds and closed PRs wait
+300 seconds before retrying. Stale entries are
 returned immediately. One detached refresh per home holds refresh.lock and uses
 at most four threads. Every CLI call has a four-second process-group timeout.
 --refresh HOME REQUESTS LOCKFD is private worker entry, not an operator command.
@@ -26,7 +27,7 @@ import time
 from urllib.parse import quote
 
 SCRIPT = Path(__file__).resolve().parent
-TTL = 60
+TTL = 5
 TIMEOUT = 4
 CONCURRENCY = 4
 
@@ -51,7 +52,8 @@ def read(home, url):
         if (record['url'] == url and isinstance(record['fetched_at'], (float, int))
                 and math.isfinite(record['fetched_at']) and record.get('live') is True
                 and (isinstance(record.get('error'), str) or record.get('state') in ('OPEN', 'MERGED', 'CLOSED'))):
-            return dict(record, stale=not 0 <= time.time() - record['fetched_at'] < TTL)
+            ttl = 60 if record.get('error') else 300 if record.get('state') in ('MERGED', 'CLOSED') else TTL
+            return dict(record, stale=not 0 <= time.time() - record['fetched_at'] < ttl)
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
@@ -218,3 +220,10 @@ if __name__ == '__main__':
             atomic(home / 'state/board-pr-updated.json', dict(time=time.time()))
         with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
             list(pool.map(save, urls))
+
+        # Reproject cached canonical records immediately, without waiting for a
+        # supervision turn or another expensive inventory read.
+        if os.environ.get('FM_BOARD_PARENT_PANE') and os.environ.get('FM_BOARD_DISABLED') != '1':
+            subprocess.Popen([sys.executable, str(SCRIPT / 'fm-board.py'), 'refresh'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
