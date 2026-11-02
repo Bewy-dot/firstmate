@@ -6,7 +6,8 @@ It reads cached forge evidence without waiting for network requests and does not
 
 The watcher refreshes the presentation when it detects a status append or turn-end marker, before wake triage or delivery.
 The viewer also requests refreshes independently, so no chat message is needed.
-Warm status and healthy forge-check updates normally reach the viewer within about ten seconds; slow or unavailable providers remain visibly cached or failed.
+Warm status updates normally reach the viewer within about ten seconds.
+Healthy open-PR evidence refreshes about once a minute; slow or unavailable providers remain visibly cached or failed.
 Expensive fleet collection runs separately from publishing the board, while changed workers are re-read through the canonical snapshot producer.
 A refresh that finds publication busy queues one follow-up that reads the latest inputs after the active writer finishes.
 Run `bin/fm-board.sh refresh` from the firstmate pane to initialize or restore it immediately.
@@ -32,7 +33,14 @@ An opened PR never by itself grants merge approval.
 
 Normal renders schedule background reads through GitHub's JSON-capable `gh` interface or the existing `glab` path for GitLab, including self-hosted instances.
 `gh-axi` remains the operator interface; its formatted PR commands do not expose the required machine-readable check fields.
-Open PR evidence is refreshed frequently; fetch failures back off and terminal PRs are checked less often.
+GitHub refreshes batch the due PRs for each host into one GraphQL query, including state, head SHA, and required check contexts.
+Optional checks are excluded; more than 100 contexts produces an explicit incomplete-evidence diagnostic rather than a green result.
+Open PR evidence has a one-minute freshness floor; fetch failures back off and terminal PRs are checked less often.
+GitHub rate-limit failures suspend requests until the reported reset time, with a conservative one-hour fallback if the reset cannot be read.
+Cached observations survive failed refreshes, with the backoff reason shown beside the check state.
+Each home limits its own board requests to 1000 GraphQL points per host in a rolling hour, reserving a conservative query bound before each call and replacing it with the reported cost when available.
+Unknown costs retain the reservation, and other homes and worker requests have separate accounting.
+The board resumes automatically as charges expire or the rate limit resets.
 The exact retry intervals belong to `bin/fm_pr_state.py`.
 Rendering uses stale evidence immediately and marks it as cached while refreshing; the viewer never waits on a forge request.
 A cold cache shows `CI FETCHING` until the background request finishes.

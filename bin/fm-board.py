@@ -154,7 +154,7 @@ def pr_checks(pr, now=None):
     checks = pr.get('check_runs')
     if not isinstance(checks, list):
         return unavailable
-    suffix = ' (cached; refreshing)' if pr.get('stale') else ' (worker reported; confirming)' if pr.get('reported') else ''
+    suffix = (' (cached; ' + plain(pr['refresh_error']) + ')' if pr.get('refresh_error') else ' (cached; refreshing)') if pr.get('stale') else ' (worker reported; confirming)' if pr.get('reported') else ''
     if not checks:
         return 'no checks configured', SECTIONS[0], 'No required checks configured' + suffix
     failed, pending, other, passed = [], [], [], 0

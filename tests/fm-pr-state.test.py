@@ -16,6 +16,29 @@ log=pathlib.Path(os.environ['CALLS'])
 with log.open('a') as out: out.write(json.dumps(dict(kind='start',pid=os.getpid(),at=time.time(),args=args))+'\n')
 try:
     time.sleep(float(os.environ.get('DELAY', '.03')))
+    if 'graphql' in args:
+        query=args[args.index('-f')+1]
+        mode=os.environ.get('GH_MODE', '')
+        if mode=='limit':
+            print('GraphQL API rate limit exceeded',file=sys.stderr); sys.exit(1)
+        data={'rateLimit':dict(cost=int(os.environ.get('GH_COST','1')),remaining=4000,resetAt='2099-01-01T00:00:00Z')}
+        errors=[]
+        changed=pathlib.Path(os.environ['CHANGE']).exists()
+        for alias, number in re.findall(r'(p\d+): repository.*?pullRequest\(number:(\d+)\)', query):
+            number=int(number)
+            reasons={7:'error connecting to api.github.com: connection refused',8:'HTTP 403: permission denied',
+                     9:'HTTP 404: Not Found',10:'request timed out after 4s',11:'invalid PR response'}
+            if number in reasons:
+                errors.append(dict(message=reasons[number],path=[alias])); data[alias]=None; continue
+            state={2:'IN_PROGRESS',3:'FAILURE'}.get(number,'FAILURE' if changed else 'SUCCESS')
+            nodes=[] if number==6 else [dict(name='tests',status='COMPLETED',conclusion=state,startedAt='2026-10-30T00:00:00Z',isRequired=True),
+                dict(context='lint',state='SUCCESS',createdAt=None,isRequired=True),
+                dict(name='optional',status='COMPLETED',conclusion='FAILURE',isRequired=False)]
+            data[alias]=dict(pullRequest=dict(state={4:'MERGED',5:'CLOSED'}.get(number,'OPEN'),headRefOid='live-head',
+                commits=dict(nodes=[dict(commit=dict(statusCheckRollup=dict(contexts=dict(nodes=nodes,pageInfo=dict(hasNextPage=mode=='overflow')))))])))
+        print(json.dumps(dict(data=data,errors=errors))); sys.exit(0)
+    if 'rate_limit' in args:
+        print(json.dumps(dict(resources=dict(graphql=dict(reset=float(os.environ['RESET'])))))); sys.exit(0)
     lab='--hostname' in args
     if lab:
         number=int(re.search(r'(?:merge_requests|pipelines)/(\d+)', ' '.join(args))[1])
@@ -75,7 +98,8 @@ class PRState(unittest.TestCase):
 
     def render(self):
         start = time.monotonic()
-        subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=self.env, capture_output=True, text=True, check=True, timeout=15)
+        result = subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return time.monotonic() - start
 
     def records(self):
@@ -164,7 +188,7 @@ class PRState(unittest.TestCase):
         self.render()
         self.assertIn('CI FAILED: tests', (self.home / 'data/board-full.md').read_text())
         starts = [json.loads(line) for line in (self.home / 'calls').read_text().splitlines() if json.loads(line)['kind'] == 'start']
-        self.assertEqual(len(starts), 4)  # two calls per observation, no duplicate child
+        self.assertEqual(len(starts), 2)  # one batched query per observation, no duplicate child
 
     def test_related_references_and_corrupt_cache_recover(self):
         self.task(1)
@@ -183,6 +207,93 @@ class PRState(unittest.TestCase):
         self.await_records(3)
         self.render()
         self.assertIn('CI GREEN', (self.home / 'data/board-full.md').read_text())
+
+    def age(self, seconds=61):
+        for path, record in self.records():
+            record['fetched_at'] -= seconds
+            record.pop('retry_at', None)
+            path.write_text(json.dumps(record))
+
+    def starts(self):
+        path = self.home / 'calls'
+        return [json.loads(line)['args'] for line in path.read_text().splitlines()
+                if json.loads(line)['kind'] == 'start'] if path.exists() else []
+
+    def test_ttl_batch_and_hourly_measurement(self):
+        for number in range(20, 30):
+            self.task(number)
+        self.render()
+        self.await_records(10)
+        calls = self.starts()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].count('graphql'), 1)
+        query = calls[0][-1]
+        self.assertEqual(query.count('pullRequest(number:'), 10)
+        self.assertIn('isRequired(pullRequestNumber:20)', query)
+        self.age(30)
+        self.render()
+        self.assertEqual(len(self.starts()), 1)  # 30-second-old OPEN records stay fresh
+        self.age(31)
+        self.render()
+        self.await_records(10, lambda rows: all(time.time()-row[1]['fetched_at'] < 10 for row in rows))
+        self.assertEqual(len(self.starts()), 2)
+        ledger = next((self.home / 'state/board-pr-cache').glob('github-*.json'))
+        self.assertEqual(json.loads(ledger.read_text())['charges'][0][1], 1)
+        print('10 PRs: old 20 calls/5s = 14,400 minimum points/hour; batch fixture 1 point/60s = 60 points/hour')
+
+    def test_rate_limit_keeps_values_and_skips_until_reset(self):
+        self.task(1)
+        self.render()
+        self.await_records(1)
+        self.age()
+        self.env.update(GH_MODE='limit', RESET=str(time.time()+3600))
+        self.render()
+        self.await_records(1, lambda rows: 'refresh_error' in rows[0][1])
+        self.assertEqual(len(self.starts()), 3)  # initial, failed batch, REST reset
+        self.age()
+        self.render()
+        time.sleep(.2)
+        self.assertEqual(len(self.starts()), 3)
+        board = (self.home / 'data/board-full.md').read_text()
+        self.assertIn('CI GREEN', board)
+        self.assertIn('cached; GitHub rate-limit backoff', board)
+        ledger = next((self.home / 'state/board-pr-cache').glob('github-*.json'))
+        data = json.loads(ledger.read_text())
+        data['blocked_until'] = time.time()-1
+        ledger.write_text(json.dumps(data))
+        self.age()
+        self.env.pop('GH_MODE')
+        self.render()
+        self.await_records(1, lambda rows: 'refresh_error' not in rows[0][1])
+        self.assertEqual(len(self.starts()), 4)
+
+    def test_budget_persists_and_recovers_after_rolling_hour(self):
+        self.task(1)
+        self.env['GH_COST'] = '997'
+        self.render()
+        self.await_records(1)
+        self.age()
+        self.render()
+        self.await_records(1, lambda rows: 'budget exhausted' in rows[0][1].get('refresh_error',''))
+        self.assertEqual(len(self.starts()), 1)
+        ledger = next((self.home / 'state/board-pr-cache').glob('github-*.json'))
+        data = json.loads(ledger.read_text())
+        data['charges'][0][0] -= 3601
+        ledger.write_text(json.dumps(data))
+        self.age()
+        self.env['GH_COST'] = '1'
+        self.render()
+        self.await_records(1, lambda rows: 'refresh_error' not in rows[0][1])
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_incomplete_contexts_never_report_green(self):
+        self.task(1)
+        self.env['GH_MODE'] = 'overflow'
+        self.render()
+        self.await_records(1)
+        self.render()
+        self.assertNotIn('CI GREEN', (self.home / 'data/board-full.md').read_text())
+        self.assertIn('required checks incomplete', (self.home / 'data/board-full.md').read_text())
 
     def test_structured_status_parser_and_scaffolds(self):
         tail = ' | pr=https://github.com/example/project/pull/1 | checks=green | next=merge | owner=captain'
