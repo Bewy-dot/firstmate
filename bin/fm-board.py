@@ -134,11 +134,17 @@ def pr_checks(pr, now=None):
     """One display mapping for live cache, offline fixtures and worker evidence."""
     if not pr or not pr.get('url'):
         return None
+    suffix = ''
+    if pr.get('stale'):
+        reason = plain(pr.get('refresh_error') or 'refreshing')
+        suffix = ' (cached; ' + reason + ')'
+    elif pr.get('reported'):
+        suffix = ' (worker reported; confirming)'
     if pr.get('state') in ('MERGED', 'CLOSED'):
         state = pr['state']
-        return state, SECTIONS[2], 'Merged' if state == 'MERGED' else 'Closed without merge'
+        return state, SECTIONS[2], ('Merged' if state == 'MERGED' else 'Closed without merge') + suffix
     if pr.get('error'):
-        return 'PR FETCH FAILED: ' + plain(pr['error']), SECTIONS[0], plain(pr['error'])
+        return 'PR FETCH FAILED: ' + plain(pr['error']), SECTIONS[0], plain(pr.get('refresh_error') or pr['error']) + suffix
     if pr.get('head_mismatch'):
         return 'PR HEAD CHANGED', SECTIONS[0], 'Recorded PR head differs from the offline evidence; refresh PR state'
     if pr.get('pending_fetch'):
@@ -154,7 +160,6 @@ def pr_checks(pr, now=None):
     checks = pr.get('check_runs')
     if not isinstance(checks, list):
         return unavailable
-    suffix = ' (cached; refreshing)' if pr.get('stale') else ' (worker reported; confirming)' if pr.get('reported') else ''
     if not checks:
         return 'no checks configured', SECTIONS[0], 'No required checks configured' + suffix
     failed, pending, other, passed = [], [], [], 0
@@ -176,7 +181,7 @@ def pr_checks(pr, now=None):
         starts = []
         for check in checks:
             try:
-                started = dt.datetime.fromisoformat(check['startedAt'].replace('Z', '+00:00'))
+                started = dt.datetime.fromisoformat((check.get('startedAt') or '').replace('Z', '+00:00'))
                 if now and started <= now and started.year > 1970:
                     starts.append(started)
             except (KeyError, TypeError, ValueError):
