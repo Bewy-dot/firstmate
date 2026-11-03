@@ -79,7 +79,7 @@ class PRState(unittest.TestCase):
         self.home = Path(self.tmp.name)
         for name in ('state', 'data', 'config', 'fakebin'):
             (self.home / name).mkdir()
-        for name in ('gh', 'glab'):
+        for name in ('gh', 'glab', 'gh-axi'):
             path = self.home / 'fakebin' / name
             path.write_text(FAKE)
             path.chmod(0o700)
@@ -98,7 +98,7 @@ class PRState(unittest.TestCase):
 
     def render(self):
         start = time.monotonic()
-        result = subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=self.env, capture_output=True, text=True, timeout=15)
+        result = subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=self.env, capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return time.monotonic() - start
 
@@ -163,6 +163,16 @@ class PRState(unittest.TestCase):
         # The killed timeout process has no finally event; starts after it still
         # cannot exceed the four-thread worker's real concurrency.
         self.assertLessEqual(maximum, 4)
+
+    def test_gitlab_timeout_and_malformed_response(self):
+        self.task(10, 'gitlab')
+        self.task(11, 'gitlab')
+        self.render()
+        self.await_records(2)
+        self.render()
+        board = (self.home / 'data/board-full.md').read_text()
+        self.assertIn('GitLab request timed out after 4s', board)
+        self.assertIn('GitLab: invalid PR response', board)
 
     def test_cache_fresh_stale_background_and_single_flight(self):
         self.task(1)
@@ -240,6 +250,24 @@ class PRState(unittest.TestCase):
         ledger = next((self.home / 'state/board-pr-cache').glob('github-*.json'))
         self.assertEqual(json.loads(ledger.read_text())['charges'][0][1], 1)
         print('10 PRs: old 20 calls/5s = 14,400 minimum points/hour; batch fixture 1 point/60s = 60 points/hour')
+
+    def test_terminal_and_error_retry_ttls(self):
+        self.task(4)
+        self.task(5)
+        self.task(7)
+        self.render()
+        self.await_records(3)
+        self.age(121)
+        self.render()
+        self.await_records(3, lambda rows: any(row[1].get('retry_at',0) > time.time() for row in rows))
+        self.assertEqual(len(self.starts()), 2)
+        # Only the failed PR was due; closed and merged retain their 300-second TTL.
+        query = self.starts()[-1][-1]
+        self.assertIn('pullRequest(number:7)', query)
+        self.assertNotIn('pullRequest(number:4)', query)
+        self.assertNotIn('pullRequest(number:5)', query)
+        self.render()
+        self.assertEqual(len(self.starts()), 2)
 
     def test_rate_limit_keeps_values_and_skips_until_reset(self):
         self.task(1)

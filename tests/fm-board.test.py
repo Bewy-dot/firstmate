@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the board's executable interface with canonical JSON fixtures."""
+import datetime as dt
 import fcntl
 import json
 import os
@@ -90,7 +91,14 @@ class Board(unittest.TestCase):
         self.home = Path(self.tmp.name)
         (self.home / 'config').mkdir()
         self.path = self.home / 'snapshot.json'
-        self.env = dict(os.environ, FM_HOME=str(self.home), FM_BOARD_DISABLED='0', FM_BACKEND='tmux')
+        fakebin = self.home / 'fakebin'
+        fakebin.mkdir(exist_ok=True)
+        for name in ('gh', 'glab', 'gh-axi'):
+            cli = fakebin / name
+            cli.write_text('#!/bin/sh\necho "offline fixture: forge access unavailable" >&2\nexit 1\n')
+            cli.chmod(0o700)
+        self.env = dict(os.environ, FM_HOME=str(self.home), FM_BOARD_DISABLED='0', FM_BACKEND='tmux',
+                        PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
         self.env.pop('NO_COLOR', None)
         self.env.pop('FM_BOARD_ICONS', None)
         self.snap = fixture()
@@ -373,7 +381,7 @@ class Board(unittest.TestCase):
         fm_write.write_text('window=default:w1:pAB\nendpoint_task_id=compensation-rules\nworktree=/w\nproject=/p\nbackend=herdr\n'
                             'herdr_session=default\nherdr_workspace_id=w1\nherdr_tab_id=w1:tAB\nherdr_pane_id=w1:pAB\n')
         fakebin = home / 'fakebin'
-        fakebin.mkdir()
+        fakebin.mkdir(exist_ok=True)
         log = home / 'calls.log'
         (fakebin / 'herdr').write_text('#!/bin/sh\necho "$*" >> ' + str(log) + '\ncase "$1 $2" in "pane get") echo \'{"result":{"pane":{"pane_id":"w1:pAB","tab_id":"w1:tAB"}}}\';; esac\n')
         (fakebin / 'herdr').chmod(0o755)
@@ -385,7 +393,7 @@ class Board(unittest.TestCase):
         self.addCleanup(os.close, slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 60, 100, 0, 0))
         process = subprocess.Popen([sys.executable, str(ROOT / 'bin/fm-board.py'), 'view'], stdin=slave, stdout=slave, stderr=slave,
-            env=dict(self.env, FM_BOARD_DISABLED='1', TERM='xterm-256color', PATH=str(fakebin) + os.pathsep + os.environ['PATH'],
+            env=dict(self.env, FM_BOARD_DISABLED='1', TERM='xterm-256color', PATH=str(fakebin) + os.pathsep + self.env['PATH'],
                      FM_BOARD_OPEN=str(fakebin / 'open-recorder')))
 
         def stop_viewer():
@@ -767,7 +775,7 @@ class Board(unittest.TestCase):
         forge.write_text('#!/bin/sh\necho offline >&2\nexit 1\n')
         forge.chmod(0o700)
         self.env.update(FM_BOARD_PARENT_PANE='parent', FM_BOARD_PARENT_TAB='tab',
-                        FM_BOARD_PARENT_WORKSPACE='ws', PATH=str(fake.parent) + os.pathsep + os.environ['PATH'])
+                        FM_BOARD_PARENT_WORKSPACE='ws', PATH=str(fake.parent) + os.pathsep + self.env['PATH'])
         (self.home / 'data/backlog.md').write_text('## In flight\n\n## Queued\n\n## Done\n')
         (self.home / 'state/fake.meta').write_text('kind=scout\nharness=codex\nbackend=tmux\nwindow=lab:fm-fake\nworktree=' + str(self.home) + '\nproject=cadenza\n')
         (self.home / 'state/fake.status').write_text('working: Implementing\n')
@@ -923,17 +931,18 @@ class Board(unittest.TestCase):
     def test_real_canonical_snapshot_backlog(self):
         (self.home / 'data').mkdir()
         (self.home / 'state').mkdir()
-        (self.home / 'data/backlog.md').write_text('## Queued\n- [ ] choose - Choose the pilot firm (repo: continuo) (kind: captain) (hold-kind: captain) (hold: Which firm pilots first?)\n\n## Done\n- [x] shipped - Firm login https://github.com/example/continuo/pull/5 (repo: continuo) (merged 2026-10-29)\n')
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        (self.home / 'data/backlog.md').write_text(f'## Queued\n- [ ] choose - Choose the pilot firm (repo: continuo) (kind: captain) (hold-kind: captain) (hold: Which firm pilots first?)\n\n## Done\n- [x] shipped - Firm login https://github.com/example/continuo/pull/5 (repo: continuo) (merged {today})\n')
         subprocess.run([str(ROOT / 'bin/fm-board.sh'), 'render'], env=dict(self.env, FM_SNAPSHOT_NOW='2026-10-30T08:00:00Z'), check=True, capture_output=True)
         self.assertIn('Which firm pilots first?', self.full())
         self.assertIn('https://github.com/example/continuo/pull/5', self.full())
         fakebin = self.home / 'fakebin'
-        fakebin.mkdir()
+        fakebin.mkdir(exist_ok=True)
         tmux = fakebin / 'tmux'
         tmux.write_text('#!/bin/sh\nexit 0\n')
         tmux.chmod(0o700)
         (self.home / 'state/worker.meta').write_text('window=test:fm-worker\nproject=isp\nkind=scout\npr=https://github.com/example/isp/pull/12\n')
-        env = dict(self.env, FM_SNAPSHOT_NOW='2026-10-30T08:00:00Z', PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
+        env = dict(self.env, FM_SNAPSHOT_NOW='2026-10-30T08:00:00Z', PATH=str(fakebin) + os.pathsep + self.env['PATH'])
         summary = json.loads(subprocess.check_output([str(ROOT / 'bin/fm-fleet-snapshot.sh'), '--secondmate-home-summary'], env=env, text=True))
         self.assertEqual(summary['endpoints'][0]['repo'], 'isp')
         self.assertEqual(summary['endpoints'][0]['pr_url'], 'https://github.com/example/isp/pull/12')

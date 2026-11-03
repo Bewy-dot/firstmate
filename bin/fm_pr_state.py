@@ -252,7 +252,7 @@ def github_refresh(home, host, entries):
                     reset = float(json.loads(raw)['resources']['graphql']['reset'])
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
-            ledger.update(blocked_until=max(now + 60, reset + 1), reason='GitHub rate-limit backoff until ' +
+            ledger.update(blocked_until=max(now + 300, reset + 1), reason='GitHub rate-limit backoff until ' +
                           dt.datetime.fromtimestamp(reset, dt.timezone.utc).isoformat())
             atomic(ledger_path, ledger)
             defer(home, urls, ledger['reason'], ledger['blocked_until'])
@@ -266,9 +266,9 @@ def github_refresh(home, host, entries):
                     raise RuntimeError('; '.join(alias_errors))
                 record = github_record(url, data[alias])
                 atomic(cache_path(home, url), record)
-            except (ValueError, KeyError, TypeError, IndexError, RuntimeError) as exc:
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError, RuntimeError) as exc:
                 defer(home, [url], failure(str(exc), 'GitHub'))
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
         defer(home, urls, failure(str(exc), 'GitHub'))
 
 
