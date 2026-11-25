@@ -5,6 +5,12 @@
 # `fm-fleet-snapshot.v1`.
 # The command is read-only: it does not acquire the session lock, drain wakes,
 # arm watchers, mutate backlog state, or write reports.
+# One opt-in exception: FM_SNAPSHOT_REMOTE_CACHE_SECONDS=N (default 0, off), set
+# by the board's refresh path, keeps each remote second mate state read and home
+# summary in state/.remote-read-cache/ for N seconds and lets only one such read
+# per key run at a time; a concurrent reader reuses the last result, or reports
+# unknown when none exists, instead of queuing another remote job. Watcher-driven
+# board refreshes therefore cannot flood the remote job queue.
 #
 # --task-json ID emits the same canonical tasks array for one recorded worker,
 # without backlog or cross-home collection, for incremental presentation reads.
@@ -88,6 +94,8 @@ case "$SNAPSHOT_EPOCH" in ''|*[!0-9]*) SNAPSHOT_EPOCH=$(date +%s) ;; esac
 # hang or explode the parent snapshot.
 FM_SNAPSHOT_SECONDMATES=${FM_SNAPSHOT_SECONDMATES:-20}
 FM_SNAPSHOT_SECONDMATE_TIMEOUT=${FM_SNAPSHOT_SECONDMATE_TIMEOUT:-8}
+FM_SNAPSHOT_REMOTE_CACHE_SECONDS=${FM_SNAPSHOT_REMOTE_CACHE_SECONDS:-0}
+case "$FM_SNAPSHOT_REMOTE_CACHE_SECONDS" in ''|*[!0-9]*) FM_SNAPSHOT_REMOTE_CACHE_SECONDS=0 ;; esac
 FM_SNAPSHOT_SECONDMATE_MAX_BYTES=${FM_SNAPSHOT_SECONDMATE_MAX_BYTES:-262144}
 FM_SNAPSHOT_SECONDMATE_CHILDREN=${FM_SNAPSHOT_SECONDMATE_CHILDREN:-20}
 FM_SNAPSHOT_SECONDMATE_QUEUED=${FM_SNAPSHOT_SECONDMATE_QUEUED:-20}
@@ -518,8 +526,8 @@ task_json_lines() {
     endpoint_exists=null
     agent_alive=not_checked
     if [ -n "$remote_host" ]; then
-      if remote_state=$(run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" \
-        "$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh state "$id" < /dev/null 2>/dev/null); then
+      if remote_state=$(remote_read_cached "state.$id" \
+        "$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh state "$id"); then
         remote_rc=0
       else
         remote_rc=$?
@@ -849,6 +857,60 @@ run_timed() {  # <seconds> <command...>
   else
     return 124
   fi
+}
+
+# remote_read_cached <key> <command...>: one bounded remote read whose stdout
+# and exit status are reused for FM_SNAPSHOT_REMOTE_CACHE_SECONDS; with the
+# default 0 it is exactly one direct run_timed call. The header owns the contract.
+remote_read_cache_hit() { # <out-file> <rc-file>; prints the cached stdout, sets REMOTE_READ_RC
+  REMOTE_READ_RC=
+  [ -f "$1" ] && [ -f "$2" ] || return 1
+  REMOTE_READ_RC=$(cat "$2" 2>/dev/null)
+  case "$REMOTE_READ_RC" in ''|*[!0-9]*) REMOTE_READ_RC=; return 1 ;; esac
+  cat "$1"
+}
+
+remote_read_cached() {
+  local key=$1 dir out_file rc_file lock now mtime rc tmp_out tmp_rc lock_age
+  shift
+  if [ "$FM_SNAPSHOT_REMOTE_CACHE_SECONDS" -eq 0 ]; then
+    run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" "$@" < /dev/null 2>/dev/null
+    return
+  fi
+  dir="$STATE/.remote-read-cache"
+  out_file="$dir/$key.out"
+  rc_file="$dir/$key.rc"
+  lock="$dir/$key.lock"
+  if ! (umask 077; mkdir -p "$dir") 2>/dev/null; then
+    run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" "$@" < /dev/null 2>/dev/null
+    return
+  fi
+  now=$(date +%s)
+  mtime=$(file_mtime_epoch "$rc_file")
+  case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+  if [ $((now - mtime)) -lt "$FM_SNAPSHOT_REMOTE_CACHE_SECONDS" ] && remote_read_cache_hit "$out_file" "$rc_file"; then
+    return "$REMOTE_READ_RC"
+  fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    lock_age=$(file_mtime_epoch "$lock")
+    case "$lock_age" in ''|*[!0-9]*) lock_age=0 ;; esac
+    if [ $((now - lock_age)) -le $((FM_SNAPSHOT_SECONDMATE_TIMEOUT + 5)) ] || ! rmdir "$lock" 2>/dev/null ||
+      ! mkdir "$lock" 2>/dev/null; then
+      # Another reader is already asking the remote host; never queue a second.
+      remote_read_cache_hit "$out_file" "$rc_file" && return "$REMOTE_READ_RC"
+      return 124
+    fi
+  fi
+  tmp_out=$(mktemp "$dir/.$key.out.XXXXXX") || { rmdir "$lock" 2>/dev/null; return 124; }
+  tmp_rc=$(mktemp "$dir/.$key.rc.XXXXXX") || { rm -f "$tmp_out"; rmdir "$lock" 2>/dev/null; return 124; }
+  run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" "$@" < /dev/null > "$tmp_out" 2>/dev/null
+  rc=$?
+  printf '%s\n' "$rc" > "$tmp_rc"
+  mv -f "$tmp_out" "$out_file"
+  mv -f "$tmp_rc" "$rc_file"
+  rmdir "$lock" 2>/dev/null || true
+  cat "$out_file"
+  return "$rc"
 }
 
 # GNU stat treats -f as a filesystem-report command, so a BSD-first fallback can
@@ -1251,8 +1313,8 @@ secondmate_current_json() {  # <parent-tasks-json>
     fi
     if [ -z "$reason" ]; then
       if [ "$remote" = true ]; then
-        summary=$(run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" \
-          "$SCRIPT_DIR/fm-on.sh" "$id" fm-fleet-snapshot.sh --secondmate-home-summary < /dev/null 2>/dev/null)
+        summary=$(remote_read_cached "summary.$id" \
+          "$SCRIPT_DIR/fm-on.sh" "$id" fm-fleet-snapshot.sh --secondmate-home-summary)
         summary_rc=$?
       else
         summary=$(run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" env \

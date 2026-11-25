@@ -21,6 +21,8 @@ Warm renders reuse state/board-snapshot.json; a separate singleton collects the
 full fleet every 30s or after structural input changes, outside board.lock.
 Changed local workers use the canonical --task-json reader (four concurrent
 reads, one-second validation CLI timeout and eight-second total timeout each), persisted in board-task-cache.json.
+Remote second mate state and summary reads are cached for 60s (single-flight)
+so watcher-driven refreshes cannot flood the remote job queue.
 board-refresh.json suppresses identical refreshes for two seconds; fingerprints
 include turn ends, metadata, status, busy markers, local homes and PR cache files.
 A contended publisher elects one detached waiter through board-follow-up.lock.
@@ -44,6 +46,9 @@ import tempfile
 import time
 
 SCRIPT = Path(__file__).resolve().parent
+# Watcher-driven refreshes fire on every status append, so remote second mate
+# reads are shared for 60s per home (fm-fleet-snapshot.sh header owns the cache).
+os.environ.setdefault('FM_SNAPSHOT_REMOTE_CACHE_SECONDS', '60')
 sys.path.insert(0, str(SCRIPT))
 GROUPS = ['Continuo', 'Cadenza', 'ISP', 'AAA', 'MCA website', 'Firstmate', 'Other']
 CATEGORIES = ['multi-firm programme', 'gaps and competitor features',
