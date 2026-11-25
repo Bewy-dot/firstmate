@@ -12,8 +12,10 @@
 # captured stdin and have a 360-second default timeout. Their stdout and stderr
 # are independently constrained to the job library's 1048576-byte bound. A
 # record is marked done only after its bounded outputs and numeric exit status
-# have been committed. The library header owns the exact record fields and
-# lifecycle.
+# have been committed. The library header owns the exact record fields,
+# lifecycle, and the scheduling contract: oldest first, steers before anything
+# else and beside one in-flight non-steer job, identical polls coalesced, and
+# expired queued jobs published without running.
 set -u
 
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -27,6 +29,12 @@ WORKER_LOCK=
 WORKER_LOCK_HELD=0
 WORKER_RELEASE_OWNERSHIP=1
 WORKER_SUPERVISED_PID=
+WORKER_ACCOUNT_HOME=
+WORKER_NESTED=0
+WORKER_NEXT_JOB=
+WORKER_CURRENT_CLASS=
+WORKER_LEADER=
+WORKER_FOLLOWERS=()
 
 worker_error() { printf 'remote-job-worker: %s\n' "$1" >&2; }
 
@@ -232,20 +240,21 @@ worker_stop_recorded_execution() { # <job-dir>
 }
 
 worker_stop_active_execution() {
+  # A steer may be executing beside an outer job, so stop the active job and
+  # then every other running job this worker owns.
   local job=${WORKER_ACTIVE_JOB:-} owner owner_pid state
   if [ -n "$job" ]; then
     worker_stop_recorded_execution "$job" || return 1
-  else
-    for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
-      [ -d "$job" ] && [ ! -L "$job" ] || continue
-      state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
-      [ "$state" = running ] || continue
-      owner="$job/.claim/owner"
-      owner_pid=$(worker_read_process_id "$owner" 2>/dev/null || true)
-      [ "$owner_pid" = "${BASHPID:-$$}" ] || continue
-      worker_stop_recorded_execution "$job" || return 1
-    done
   fi
+  for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
+    [ -d "$job" ] && [ ! -L "$job" ] || continue
+    state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
+    [ "$state" = running ] || continue
+    owner="$job/.claim/owner"
+    owner_pid=$(worker_read_process_id "$owner" 2>/dev/null || true)
+    [ "$owner_pid" = "${BASHPID:-$$}" ] || continue
+    worker_stop_recorded_execution "$job" || return 1
+  done
   WORKER_ACTIVE_JOB=
 }
 
@@ -339,10 +348,33 @@ worker_read_text() { # <job-dir> <field> <max>
   printf '%s\n' "$value"
 }
 
+worker_publish_followers() { # <leader-job-dir> <exit>
+  # Runs before the leader's own done state, so the leader's caller cannot reap
+  # the shared output before every coalesced follower has its copy.
+  local leader=$1 exit_status=$2 follower rc
+  [ "${#WORKER_FOLLOWERS[@]}" -gt 0 ] || return 0
+  for follower in "${WORKER_FOLLOWERS[@]}"; do
+    rc=$exit_status
+    if [ -f "$follower/stdout" ] && [ ! -L "$follower/stdout" ] &&
+      [ -f "$follower/stderr" ] && [ ! -L "$follower/stderr" ] &&
+      cat "$leader/stdout" > "$follower/stdout" 2>/dev/null &&
+      cat "$leader/stderr" > "$follower/stderr" 2>/dev/null; then
+      :
+    else
+      rc=125
+    fi
+    worker_publish_result "$follower" "$rc" || worker_error "could not publish coalesced result for ${follower##*/}"
+  done
+  WORKER_FOLLOWERS=()
+}
+
 worker_publish_result() { # <job-dir> <exit>
   local job=$1 exit_status=$2 tmp
   case "$exit_status" in ''|*[!0-9]*) exit_status=125 ;; esac
   [ "$exit_status" -le 255 ] || exit_status=125
+  if [ -n "${WORKER_LEADER:-}" ] && [ "$WORKER_LEADER" = "$job" ]; then
+    worker_publish_followers "$job" "$exit_status"
+  fi
   for tmp in stdout stderr; do
     fm_remote_job_regular_bounded "$job/$tmp" "$FM_REMOTE_JOB_MAX_BYTES" || return 1
   done
@@ -422,6 +454,7 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
         break
       fi
       next_heartbeat=$((SECONDS + 1))
+      worker_run_nested_steer "$job"
     fi
     sleep "$FM_REMOTE_JOB_POLL_SECONDS"
   done
@@ -541,8 +574,17 @@ worker_run_job() { # <account-home> <job-dir>
   worker_publish_result "$job" "$rc" || worker_error "could not publish result for ${job##*/}"
 }
 
-worker_process_once() { # <account-home>
-  local account_home=$1 job id state queue_deadline timeout deadline
+worker_expire_job() { # <job-dir>
+  local job=$1
+  if [ -f "$job/stderr" ] && [ ! -L "$job/stderr" ]; then
+    printf '%s\n' "$FM_REMOTE_JOB_EXPIRED_MESSAGE" > "$job/stderr" 2>/dev/null || true
+  fi
+  worker_publish_result "$job" "$FM_REMOTE_JOB_EXIT_EXPIRED"
+}
+
+worker_pick_next() { # <steer-only:0|1>; sets WORKER_NEXT_JOB, oldest steer first, else oldest job
+  local steer_only=$1 job id state queue_deadline class first_other=
+  WORKER_NEXT_JOB=
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
     id=${job##*/}
@@ -551,38 +593,118 @@ worker_process_once() { # <account-home>
     [ -n "$job" ] || continue
     state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
     case "$state" in
-      queued)
-        worker_clear_dead_claim "$job" || continue
-        queue_deadline=$(fm_remote_job_read_number "$job" queue_deadline 2>/dev/null || true)
-        case "$queue_deadline" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; continue ;; esac
-        if [ "$(date +%s)" -ge "$queue_deadline" ]; then
-          worker_publish_result "$job" 124 || true
-          continue
-        fi
-        ;;
+      queued) ;;
       running)
-        worker_recover_orphaned_job "$job" || true
+        [ "$steer_only" -eq 1 ] || worker_recover_orphaned_job "$job" || true
         continue
         ;;
       *) continue ;;
     esac
-    worker_claim "$job" || continue
-    timeout=$(fm_remote_job_read_number "$job" timeout 2>/dev/null || true)
-    case "$timeout" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; continue ;; esac
-    if [ "$timeout" -gt 3600 ]; then
-      worker_publish_result "$job" 126 || true
+    class=$(fm_remote_job_class "$job")
+    [ "$steer_only" -eq 0 ] || [ "$class" = steer ] || continue
+    worker_clear_dead_claim "$job" || continue
+    queue_deadline=$(fm_remote_job_read_number "$job" queue_deadline 2>/dev/null || true)
+    case "$queue_deadline" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; continue ;; esac
+    if [ "$(date +%s)" -ge "$queue_deadline" ]; then
+      worker_expire_job "$job" || true
       continue
     fi
-    deadline=$(( $(date +%s) + timeout ))
-    fm_remote_job_write_number "$job" deadline "$deadline" || {
+    if [ "$class" = steer ]; then
+      WORKER_NEXT_JOB=$job
+      return 0
+    fi
+    [ -n "$first_other" ] || first_other=$job
+  done
+  WORKER_NEXT_JOB=$first_other
+}
+
+worker_claim_followers() { # <leader-job-dir> <deadline>; claims queued identical polls
+  local leader=$1 deadline=$2 job id state queue_deadline field now
+  [ "$(fm_remote_job_class "$leader")" = poll ] || return 0
+  now=$(date +%s)
+  for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
+    [ "$job" != "$leader" ] && [ -d "$job" ] && [ ! -L "$job" ] || continue
+    id=${job##*/}
+    fm_remote_job_safe_id "$id" || continue
+    job=$(fm_remote_job_job_dir "$id" 2>/dev/null || true)
+    [ -n "$job" ] && [ "$job" != "$leader" ] || continue
+    state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
+    [ "$state" = queued ] || continue
+    for field in root home argv stdin; do
+      fm_remote_job_regular_bounded "$job/$field" "$FM_REMOTE_JOB_MAX_BYTES" || continue 2
+      cmp -s -- "$leader/$field" "$job/$field" || continue 2
+    done
+    worker_clear_dead_claim "$job" || continue
+    queue_deadline=$(fm_remote_job_read_number "$job" queue_deadline 2>/dev/null || true)
+    case "$queue_deadline" in ''|*[!0-9]*) continue ;; esac
+    [ "$now" -lt "$queue_deadline" ] || continue
+    worker_claim "$job" || continue
+    if ! fm_remote_job_write_number "$job" deadline "$deadline" || ! fm_remote_job_write_state "$job" running; then
       worker_publish_result "$job" 125 || true
       continue
-    }
-    fm_remote_job_write_state "$job" running || {
-      worker_publish_result "$job" 125 || true
-      continue
-    }
-    worker_run_job "$account_home" "$job"
+    fi
+    WORKER_FOLLOWERS+=("$job")
+  done
+}
+
+worker_execute_job() { # <job-dir>; returns 1 only when the job could not be claimed
+  local job=$1 timeout deadline
+  local WORKER_CURRENT_CLASS WORKER_LEADER
+  local -a WORKER_FOLLOWERS=()
+  worker_claim "$job" || return 1
+  WORKER_CURRENT_CLASS=$(fm_remote_job_class "$job")
+  WORKER_LEADER=
+  timeout=$(fm_remote_job_read_number "$job" timeout 2>/dev/null || true)
+  case "$timeout" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; return 0 ;; esac
+  if [ "$timeout" -gt 3600 ]; then
+    worker_publish_result "$job" 126 || true
+    return 0
+  fi
+  deadline=$(( $(date +%s) + timeout ))
+  fm_remote_job_write_number "$job" deadline "$deadline" || {
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  fm_remote_job_write_state "$job" running || {
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  if [ "$WORKER_CURRENT_CLASS" = poll ]; then
+    WORKER_LEADER=$job
+    worker_claim_followers "$job" "$deadline"
+  fi
+  worker_run_job "$WORKER_ACCOUNT_HOME" "$job"
+  # A leader whose own publish failed still owes its followers a result.
+  [ "${#WORKER_FOLLOWERS[@]}" -eq 0 ] || worker_publish_followers "$job" 125
+  return 0
+}
+
+worker_run_nested_steer() { # <outer-job-dir>; runs one queued steer beside a non-steer job
+  local outer=$1 saved_active=$WORKER_ACTIVE_JOB errexit=0
+  [ "$WORKER_NESTED" -eq 0 ] || return 0
+  [ "${WORKER_CURRENT_CLASS:-}" != steer ] || return 0
+  [ -n "$WORKER_ACCOUNT_HOME" ] || return 0
+  case $- in *e*) errexit=1 ;; esac
+  set +e
+  WORKER_NESTED=1
+  worker_pick_next 1
+  if [ -n "$WORKER_NEXT_JOB" ] && [ "$WORKER_NEXT_JOB" != "$outer" ]; then
+    worker_execute_job "$WORKER_NEXT_JOB"
+    worker_write_heartbeat
+  fi
+  WORKER_NESTED=0
+  WORKER_ACTIVE_JOB=$saved_active
+  if [ "$errexit" -eq 1 ]; then set -e; fi
+  return 0
+}
+
+worker_process_once() { # <account-home>
+  WORKER_ACCOUNT_HOME=$1
+  while :; do
+    worker_pick_next 0
+    [ -n "$WORKER_NEXT_JOB" ] || break
+    worker_execute_job "$WORKER_NEXT_JOB" || break
+    worker_write_heartbeat || return 1
   done
 }
 

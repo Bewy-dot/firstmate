@@ -32,6 +32,10 @@ The entrypoint authorizes that bootstrap with normal git tracking when git resol
 After setup, every other command verifies Firstmate's account-owned remote job worker, stages the encoded argv and stdin bytes, waits for its result, and relays stdout, stderr, and the exit status separately.
 If the SSH session that staged a command is gone, for example because the local caller timed out, the remote waiter exits within about a second and withdraws the command if the worker has not started it, so abandoned requests never pile up as orphaned waiters or stale queued work.
 The board reuses each remote second mate state read and home summary for 60 seconds and never runs two at once for the same second mate, so watcher-driven refreshes cannot flood the remote queue.
+The worker takes queued commands oldest first, except that a steer (a send or key to the second mate) always goes ahead of other queued work and may run beside one in-flight command, so a long reply poll or a backlog of state reads cannot delay it by more than about a second.
+Identical queued read-only polls, such as repeated state reads or home summaries for the same second mate, are answered by a single run.
+A queued command whose queue deadline passes before it starts is never run and returns exit 75; `fm-send.sh` reports such a steer as not delivered and safe to resend, while transport loss, an execution timeout, or a worker stop leaves delivery unknown and forbids a blind resend.
+`bin/fm-remote-job-lib.sh` owns the exact scheduling contract.
 On macOS the worker is `dev.firstmate.remote-job`, an Aqua-scoped LaunchAgent at `~/Library/LaunchAgents/dev.firstmate.remote-job.plist` with logs under `~/Library/Logs/`.
 After that bootstrap every non-doctor `fm-on.sh` target runs through that worker in the remote account's GUI session, never in the SSH process or a Herdr pane.
 Linux uses the same queue and worker protocol without the Aqua-session requirement.

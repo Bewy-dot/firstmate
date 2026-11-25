@@ -24,6 +24,19 @@
 # FM_REMOTE_JOB_POLL_SECONDS for the first two seconds, then every
 # FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS.
 #
+# Scheduling: staged job ids begin with their staging epoch, so the worker takes
+# queued jobs oldest first. fm_remote_job_argv_class names each job's class:
+# steer (fm-remote-secondmate-control.sh send|key) is always taken before any
+# other queued job, and one steer may also run beside an in-flight non-steer job
+# so a long poll can never starve it; steers never run beside each other. poll
+# (read-only state, route, observe, capture, home-summary snapshot, and delta
+# reads) is coalesced: when the worker starts a poll it also claims every queued
+# job with identical root, home, argv, and stdin and publishes that one run's
+# result to each of them. A queued job whose queue_deadline passes before it
+# starts is never run; it is published with FM_REMOTE_JOB_EXIT_EXPIRED (75) and
+# a stderr line saying it expired before starting, distinct from the execution
+# timeout 124 and the unknown-completion 125.
+#
 # The worker accepts only a tracked, non-symlink executable named fm-*.sh below
 # its configured FM_ROOT/bin. Every child receives env -i with the composed
 # PATH, HOME, FM_HOME, FM_ROOT_OVERRIDE, and FM_REMOTE_JOB_ACTIVE=1. The PATH
@@ -46,6 +59,10 @@ FM_REMOTE_JOB_POLL_SECONDS=${FM_REMOTE_JOB_POLL_SECONDS:-0.05}
 FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS=${FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS:-0.5}
 FM_REMOTE_JOB_CALLER_GONE=0
 FM_REMOTE_JOB_REAP_SECONDS=${FM_REMOTE_JOB_REAP_SECONDS:-3600}
+# shellcheck disable=SC2034 # Sourceable API consumed by the worker and tests.
+FM_REMOTE_JOB_EXIT_EXPIRED=75
+# shellcheck disable=SC2034 # Sourceable API consumed by the worker.
+FM_REMOTE_JOB_EXPIRED_MESSAGE='remote job expired in the remote queue before it started; it was never run'
 FM_REMOTE_JOB_OPERATOR_PATH=
 FM_REMOTE_JOB_CHILD_PATH=
 FM_REMOTE_JOB_STATE=
@@ -456,7 +473,8 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
   }
   case "$command" in fm-*.sh) ;; *) FM_REMOTE_JOB_ERROR="remote job command is outside the fm-*.sh namespace"; return 1 ;; esac
   case "$command" in */*|*..*) FM_REMOTE_JOB_ERROR="remote job command contains a path or traversal"; return 1 ;; esac
-  stage=$(umask 077; mktemp -d "$FM_REMOTE_JOB_JOBS/.stage.XXXXXX") || {
+  # The epoch prefix makes the job-* glob order oldest first for the worker.
+  stage=$(umask 077; mktemp -d "$FM_REMOTE_JOB_JOBS/.stage.$(date +%s).XXXXXX") || {
     FM_REMOTE_JOB_ERROR="cannot stage remote job"
     return 1
   }
@@ -495,6 +513,32 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
   # shellcheck disable=SC2034 # Sourceable API consumed by callers that do not use command substitution.
   FM_REMOTE_JOB_ID=$id
   printf '%s\n' "$id"
+}
+
+fm_remote_job_argv_class() { # <command> [args...]; prints steer|poll|normal
+  local class=normal
+  case "${1:-}" in
+    fm-remote-secondmate-control.sh)
+      case "${2:-}:$#" in
+        send:4|key:4) class=steer ;;
+        state:3|route:3|observe:3|capture:3|capture:4) class=poll ;;
+      esac
+      ;;
+    fm-fleet-snapshot.sh)
+      [ "$#" -eq 2 ] && [ "$2" = --secondmate-home-summary ] && class=poll
+      ;;
+    fm-remote-delta-read.sh) class=poll ;;
+  esac
+  printf '%s\n' "$class"
+}
+
+fm_remote_job_class() { # <job-dir>; classifies the staged argv, normal when unreadable
+  local job=$1 arg
+  local -a argv=()
+  fm_remote_job_regular_bounded "$job/argv" "$FM_REMOTE_JOB_MAX_BYTES" || { printf 'normal\n'; return 0; }
+  while IFS= read -r -d '' arg; do argv+=("$arg"); done < "$job/argv"
+  [ "${#argv[@]}" -ge 1 ] || { printf 'normal\n'; return 0; }
+  fm_remote_job_argv_class "${argv[@]}"
 }
 
 fm_remote_job_caller_chain() { # prints up to three comma-separated ancestor pids, ending at the SSH session

@@ -36,6 +36,11 @@
 # resolves the expectation. Set FM_PENDING_REPLY_EXISTING_CORR=<id> when
 # re-sending a recovery request for an already-open expectation so a second
 # record is not created. Direct unmarked captain input never creates one.
+# A remote secondmate send exits non-zero unless the remote job confirmed the
+# submit: a steer that expired in the remote job queue (exit 75, see
+# bin/fm-remote-job-lib.sh) is reported as not delivered and safe to resend,
+# while transport loss (255), an execution timeout (124), or a worker stop
+# (125) keeps the expectation as delivery-unknown and forbids a blind resend.
 #
 # After a successful text submit fm-send pauses FM_SEND_SETTLE seconds (default 1,
 # 0 disables) before returning: submit confirmation only proves the text was
@@ -330,10 +335,27 @@ else
     send_rc=$?
   fi
   if [ "$send_rc" -ne 0 ]; then
-    if [ "$TARGET_BACKEND" = remote ] && [ "$send_rc" -eq 255 ] && [ -n "$PENDING_REPLY_CORR" ]; then
-      fm_pending_reply_mark_delivery_unknown "$STATE" "$PENDING_REPLY_CORR" || true
-      echo "error: text delivery to remote secondmate $TARGET_REMOTE_ID is unknown; do not resend - same-host reconciliation is required" >&2
-      exit 1
+    if [ "$TARGET_BACKEND" = remote ]; then
+      case "$send_rc" in
+        75)
+          # The remote job queue published that the steer expired before it
+          # started, so nothing was typed and a resend cannot duplicate it.
+          if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
+            fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
+          fi
+          echo "error: text NOT delivered to remote secondmate $TARGET_REMOTE_ID: it expired in the remote job queue before it started, so it was never typed; it is safe to resend" >&2
+          exit 1
+          ;;
+        124|125|255)
+          # Transport loss (255), an execution timeout (124), or a worker stop
+          # mid-job (125) leave completion unknown: the text may have landed.
+          if [ -n "$PENDING_REPLY_CORR" ]; then
+            fm_pending_reply_mark_delivery_unknown "$STATE" "$PENDING_REPLY_CORR" || true
+          fi
+          echo "error: text delivery to remote secondmate $TARGET_REMOTE_ID is unknown (remote exit $send_rc); do not resend - same-host reconciliation is required" >&2
+          exit 1
+          ;;
+      esac
     fi
     if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
       fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true

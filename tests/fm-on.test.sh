@@ -59,13 +59,25 @@ cp "$ROOT/bin/fm-remote-doctor.sh" "$ROOT/bin/fm-tasks-axi-lib.sh" \
 mkdir -p "$REMOTE_ROOT/bin/backends"
 cp "$ROOT/bin/backends/herdr.sh" "$REMOTE_ROOT/bin/backends/herdr.sh"
 # Stands in for the remote control script: state reads are counted so the
-# tests can prove how many remote jobs a caller really ran.
+# tests can prove how many remote jobs a caller really ran, sends are logged as
+# typed, and a send named "blocker" holds the steer slot while its flag exists.
 cat > "$REMOTE_ROOT/bin/fm-remote-secondmate-control.sh" <<'SH'
 #!/usr/bin/env bash
 set -u
-[ "$1" = state ] || exit 2
-printf '%s\n' "$2" >> "$FM_HOME/state-reads.log"
-printf 'alive\n'
+case "$1" in
+  state)
+    printf '%s\n' "$2" >> "$FM_HOME/state-reads.log"
+    printf 'alive\n'
+    ;;
+  send)
+    if [ "$3" = blocker ]; then
+      : > "$FM_HOME/blocker.started"
+      while [ -f "$FM_HOME/blocker.hold" ]; do sleep 0.05; done
+    fi
+    printf '%s\n' "$3" >> "$FM_HOME/typed.log"
+    ;;
+  *) exit 2 ;;
+esac
 SH
 # Holds the single worker slot while its flag file exists.
 cat > "$REMOTE_ROOT/bin/fm-hold.sh" <<'SH'
@@ -548,5 +560,53 @@ if command -v jq >/dev/null 2>&1; then
     || fail "uncached snapshots did not read remote state directly"
   pass "board snapshots share one remote state read per cache window and never stack reads"
 fi
+
+# A remote steer that expires in the remote queue must never look delivered.
+mkdir -p "$LOCAL_HOME/state"
+printf 'window=remote:ios\nkind=secondmate\nharness=codex\nremote_host=remote-mac\n' > "$LOCAL_HOME/state/ios.meta"
+fm_send_remote() {
+  FM_HOME="$LOCAL_HOME" \
+  FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+  FM_SSH_BIN="$FAKEBIN/fake-ssh" \
+  FM_FAKE_SSH_COUNT="$SSH_COUNT" \
+  FM_FAKE_SSH_LOG="$SSH_LOG" \
+  FM_FAKE_REMOTE_ENTRYPOINT="$REMOTE_ROOT/bin/fm-remote-entrypoint.sh" \
+  FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+  FM_REMOTE_JOB_STATE_ROOT="$TMP_ROOT/remote-jobs" \
+  FM_SEND_SETTLE=0 \
+  "$ROOT/bin/fm-send.sh" "$@"
+}
+: > "$REMOTE_HOME/typed.log"
+fm_send_remote fm-ios 'delivered steer' < /dev/null > "$TMP_ROOT/send-ok.out" 2> "$TMP_ROOT/send-ok.err" \
+  || fail "a healthy remote send failed: $(cat "$TMP_ROOT/send-ok.err")"
+assert_grep 'delivered steer' "$REMOTE_HOME/typed.log" "a healthy remote send did not reach the remote control"
+
+: > "$REMOTE_HOME/blocker.hold"
+fm_on ios fm-remote-secondmate-control.sh send ios blocker < /dev/null > /dev/null 2>&1 &
+BLOCKER_PID=$!
+for _ in $(seq 1 100); do
+  [ -f "$REMOTE_HOME/blocker.started" ] && break
+  sleep 0.05
+done
+assert_present "$REMOTE_HOME/blocker.started" "the blocking remote steer did not start"
+( sleep 2; rm -f -- "$REMOTE_HOME/blocker.hold" ) &
+RELEASE_PID=$!
+set +e
+FM_REMOTE_JOB_QUEUE_TIMEOUT=1 fm_send_remote fm-ios 'expired steer' \
+  < /dev/null > "$TMP_ROOT/send-expired.out" 2> "$TMP_ROOT/send-expired.err"
+rc=$?
+set -e
+wait "$RELEASE_PID" 2>/dev/null || true
+wait "$BLOCKER_PID" 2>/dev/null || true
+[ "$rc" -ne 0 ] || fail "fm-send exited 0 for a remote steer that expired in the remote queue"
+assert_grep 'NOT delivered to remote secondmate ios' "$TMP_ROOT/send-expired.err" \
+  "fm-send did not say the expired remote steer was not delivered"
+assert_grep 'expired in the remote job queue' "$TMP_ROOT/send-expired.err" \
+  "fm-send did not name queue expiry as the reason"
+sleep 0.5
+if grep -q 'expired steer' "$REMOTE_HOME/typed.log"; then fail "the expired remote steer was typed after its deadline"; fi
+PENDING_LEFT=$(grep -rls 'expired steer' "$LOCAL_HOME/state/pending-replies" 2>/dev/null | wc -l | tr -d ' ')
+[ "$PENDING_LEFT" -eq 0 ] || fail "the expired remote steer left a pending-reply expectation as if delivered"
+pass "a remote steer that expires in the remote queue fails fm-send with a clear not-delivered message"
 
 echo "ALL TESTS PASSED"
