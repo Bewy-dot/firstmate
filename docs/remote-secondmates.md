@@ -33,6 +33,7 @@ After setup, every other command verifies Firstmate's account-owned remote job w
 If the SSH session that staged a command is gone, for example because the local caller timed out, the remote waiter exits within about a second and withdraws the command if the worker has not started it, so abandoned requests never pile up as orphaned waiters or stale queued work.
 The board reuses each remote second mate state read and home summary for 60 seconds and never runs two at once for the same second mate, so watcher-driven refreshes cannot flood the remote queue.
 The worker takes queued commands oldest first, except that a steer (a send or key to the second mate) always goes ahead of other queued work and may run beside one in-flight command, so a long reply poll or a backlog of state reads cannot delay it by more than about a second.
+While a long reply poll is running, any other queued command, such as a state read, an inheritance push, or a relaunch step, also starts beside it within about a second instead of waiting out the poll.
 Identical queued read-only polls, such as repeated state reads or home summaries for the same second mate, are answered by a single run.
 A queued command whose queue deadline passes before it starts is never run and returns exit 75; `fm-send.sh` reports such a steer as not delivered and safe to resend, while transport loss, an execution timeout, or a worker stop leaves delivery unknown and forbids a blind resend.
 `bin/fm-remote-job-lib.sh` owns the exact scheduling contract.
@@ -160,7 +161,8 @@ FM_HOME=<primary-home> bin/fm-send.sh fm-<id> '<request>'
 
 Marked requests keep the existing correlation contract.
 The remote charter appends replies to `state/parent-replies.status` in the remote home.
-A process-event source performs a non-destructive, cursor-anchored delta read, validates bounded correlated status lines, fetches only referenced `data/*.md` documents through the confined reader, and appends each accepted line at most once to the primary status channel.
+A process-event source performs a non-destructive, cursor-anchored delta read, validates bounded status lines, fetches only referenced `data/*.md` documents through the confined reader, and appends each accepted line at most once to the primary status channel.
+A line with `corr=<id>` answers its marked request; a valid line without one, such as a spontaneous declared pause, is relayed as an uncorrelated event that answers nothing, and a malformed line is skipped and reported without stopping the relay.
 The source log is never truncated or consumed.
 A shortened or changed prefix stops the relay and surfaces a continuity failure instead of silently resetting the cursor.
 

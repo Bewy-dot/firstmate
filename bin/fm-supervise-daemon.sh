@@ -1213,7 +1213,7 @@ handle_wake() {  # <reason> <state>
               case "$arg" in *" ("*) stale_detail="${arg#*" ("}"; arg="${arg%% \(*}" ;; esac
               decision=$(classify_stale "$arg" "$state")
               case "$stale_detail" in
-                idle\ *s,\ possible\ wedge,\ escalation\ *)
+                idle\ *s,\ possible\ wedge,\ escalation\ *|idle\ *s\ after\ its\ last\ report,*)
                   decision="escalate|${reason#stale: }" ;;
               esac ;;
     check:*)  decision=$(classify_check "$reason") ;;

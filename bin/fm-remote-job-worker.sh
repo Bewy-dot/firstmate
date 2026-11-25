@@ -14,8 +14,9 @@
 # record is marked done only after its bounded outputs and numeric exit status
 # have been committed. The library header owns the exact record fields,
 # lifecycle, and the scheduling contract: oldest first, steers before anything
-# else and beside one in-flight non-steer job, identical polls coalesced, and
-# expired queued jobs published without running.
+# else and beside one in-flight non-steer job, any other job beside an in-flight
+# long poll, identical polls coalesced, and expired queued jobs published
+# without running.
 set -u
 
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -454,7 +455,7 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
         break
       fi
       next_heartbeat=$((SECONDS + 1))
-      worker_run_nested_steer "$job"
+      worker_run_nested_job "$job"
     fi
     sleep "$FM_REMOTE_JOB_POLL_SECONDS"
   done
@@ -582,8 +583,11 @@ worker_expire_job() { # <job-dir>
   worker_publish_result "$job" "$FM_REMOTE_JOB_EXIT_EXPIRED"
 }
 
-worker_pick_next() { # <steer-only:0|1>; sets WORKER_NEXT_JOB, oldest steer first, else oldest job
-  local steer_only=$1 job id state queue_deadline class first_other=
+# <mode>: all (the main loop), steer (beside a non-steer job), or short (beside
+# a long poll: any job except another long poll). Sets WORKER_NEXT_JOB to the
+# oldest eligible steer, else the oldest eligible job.
+worker_pick_next() { # <all|steer|short>
+  local mode=$1 job id state queue_deadline class first_other=
   WORKER_NEXT_JOB=
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
@@ -595,13 +599,16 @@ worker_pick_next() { # <steer-only:0|1>; sets WORKER_NEXT_JOB, oldest steer firs
     case "$state" in
       queued) ;;
       running)
-        [ "$steer_only" -eq 1 ] || worker_recover_orphaned_job "$job" || true
+        [ "$mode" != all ] || worker_recover_orphaned_job "$job" || true
         continue
         ;;
       *) continue ;;
     esac
     class=$(fm_remote_job_class "$job")
-    [ "$steer_only" -eq 0 ] || [ "$class" = steer ] || continue
+    case "$mode:$class" in
+      steer:steer|short:steer|short:poll|short:normal|all:*) ;;
+      *) continue ;;
+    esac
     worker_clear_dead_claim "$job" || continue
     queue_deadline=$(fm_remote_job_read_number "$job" queue_deadline 2>/dev/null || true)
     case "$queue_deadline" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; continue ;; esac
@@ -620,7 +627,7 @@ worker_pick_next() { # <steer-only:0|1>; sets WORKER_NEXT_JOB, oldest steer firs
 
 worker_claim_followers() { # <leader-job-dir> <deadline>; claims queued identical polls
   local leader=$1 deadline=$2 job id state queue_deadline field now
-  [ "$(fm_remote_job_class "$leader")" = poll ] || return 0
+  case "$(fm_remote_job_class "$leader")" in poll|longpoll) ;; *) return 0 ;; esac
   now=$(date +%s)
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ "$job" != "$leader" ] && [ -d "$job" ] && [ ! -L "$job" ] || continue
@@ -669,7 +676,7 @@ worker_execute_job() { # <job-dir>; returns 1 only when the job could not be cla
     worker_publish_result "$job" 125 || true
     return 0
   }
-  if [ "$WORKER_CURRENT_CLASS" = poll ]; then
+  if [ "$WORKER_CURRENT_CLASS" = poll ] || [ "$WORKER_CURRENT_CLASS" = longpoll ]; then
     WORKER_LEADER=$job
     worker_claim_followers "$job" "$deadline"
   fi
@@ -679,15 +686,21 @@ worker_execute_job() { # <job-dir>; returns 1 only when the job could not be cla
   return 0
 }
 
-worker_run_nested_steer() { # <outer-job-dir>; runs one queued steer beside a non-steer job
-  local outer=$1 saved_active=$WORKER_ACTIVE_JOB errexit=0
+# Runs one queued job beside an in-flight one: a steer beside any non-steer job,
+# or any job except another long poll beside a long poll.
+worker_run_nested_job() { # <outer-job-dir>
+  local outer=$1 saved_active=$WORKER_ACTIVE_JOB errexit=0 mode
   [ "$WORKER_NESTED" -eq 0 ] || return 0
-  [ "${WORKER_CURRENT_CLASS:-}" != steer ] || return 0
+  case "${WORKER_CURRENT_CLASS:-}" in
+    steer) return 0 ;;
+    longpoll) mode=short ;;
+    *) mode=steer ;;
+  esac
   [ -n "$WORKER_ACCOUNT_HOME" ] || return 0
   case $- in *e*) errexit=1 ;; esac
   set +e
   WORKER_NESTED=1
-  worker_pick_next 1
+  worker_pick_next "$mode"
   if [ -n "$WORKER_NEXT_JOB" ] && [ "$WORKER_NEXT_JOB" != "$outer" ]; then
     worker_execute_job "$WORKER_NEXT_JOB"
     worker_write_heartbeat
@@ -701,7 +714,7 @@ worker_run_nested_steer() { # <outer-job-dir>; runs one queued steer beside a no
 worker_process_once() { # <account-home>
   WORKER_ACCOUNT_HOME=$1
   while :; do
-    worker_pick_next 0
+    worker_pick_next all
     [ -n "$WORKER_NEXT_JOB" ] || break
     worker_execute_job "$WORKER_NEXT_JOB" || break
     worker_write_heartbeat || return 1

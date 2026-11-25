@@ -589,7 +589,9 @@ FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE; seconds a live watche
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
-FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stopped/unknown stale panes surface immediately; reconciled done/parked crews stay idle and declared pauses use their own cadence
+FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stopped/unknown stale panes surface immediately; reconciled done/parked crews follow FM_IDLE_WAKE_SECS and declared pauses use their own cadence
+FM_IDLE_WAKE_SECS=600              # seconds a reconciled done/parked worker may sit on an unchanged pane before its supervisor is woken once per idle episode that it needs its next job; 0 disables the timer
+FM_IDLE_WAKE_MERGED_SECS=120       # shorter grace for that one wake once the PR a worker's latest next=merge report waited on is recorded merged in state/<id>.pr-merged
 FM_BUSY_TURN_MAX_SECS=3600         # maximum age of a busy pane's latest state/<id>.turn-ended marker, or its state/<id>.meta spawn record before any turn completes, before the same wedge escalation used for a provably-working non-busy stale takes over; inspection-only, never an automatic interrupt or restart
 FM_PAUSE_RESURFACE_SECS=3600       # seconds before an idle declared external wait re-surfaces for a recheck in the watcher or away-mode daemon
 FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive provably-working stale escalations on the same unchanged pane before demand-deep-inspection is added

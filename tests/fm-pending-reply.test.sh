@@ -16,7 +16,8 @@
 #   7. Restart/compaction preserves the expectation and exact parent destination
 #   8. Wrong-home reports are detected but do not silently acknowledge
 #   9. Direct unmarked captain input creates no expectation
-#  10. fm-send secondmate path embeds corr and creates durable pending records
+#  10. fm-send secondmate path embeds corr and creates durable pending records;
+#      --no-reply marks a one-way message and creates none
 #  11. Backend busy/idle observation works through the shared busy abstraction
 #      used by Pi/Claude secondmate backends (no conversation scrape)
 set -u
@@ -614,6 +615,29 @@ test_fm_send_marked_secondmate_creates_pending_and_embeds_corr() {
   pass "fm-send marked secondmate path creates pending and embeds corr"
 }
 
+test_fm_send_no_reply_marks_without_expectation() {
+  local dir fb log home rc got pending_count
+  dir="$TMP_ROOT/send-no-reply"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_parent send-no-reply)
+  fm_write_secondmate_meta "$home/state/hibit.meta" "$home/sm" "sess:fm-hibit"
+  run_send "$fb" "$home" "$log" --no-reply "hibit" "captain decided: ship families next"; rc=$?
+  expect_code 0 "$rc" "one-way secondmate send should succeed"
+  got=$(cat "$log")
+  [ "$got" = "${FM_FROMFIRST_MARK}no-reply captain decided: ship families next" ] \
+    || fail "one-way send must carry the marker and no-reply token, not a corr"$'\n'"$(printf '%s' "$got" | od -An -c)"
+  [ -z "$(fm_pending_reply_extract_corr "$got")" ] || fail "one-way send must not embed a correlation token"
+  pending_count=$(find "$home/state/pending-replies" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pending_count" = 0 ] || fail "one-way send must create no pending-reply records (got $pending_count)"
+  fm_pending_reply_tick "$home/state" >/dev/null 2>&1 || true
+  [ ! -e "$home/state/hibit.status" ] || ! grep -q 'pending-reply-missed' "$home/state/hibit.status" \
+    || fail "one-way send must never escalate a missed reply"
+  run_send "$fb" "$home" "$log" --no-reply "hibit" "corr=0123456789abcdef already correlated"; rc=$?
+  expect_code 2 "$rc" "--no-reply must refuse a message that already carries a correlation"
+  [ ! -s "$log" ] || fail "a refused one-way send must type nothing"
+  pass "fm-send --no-reply marks a secondmate message without a pending expectation"
+}
+
 test_document_pointer_resolves() {
   local home state corr
   home=$(setup_parent doc-pointer)
@@ -921,6 +945,7 @@ test_restart_preserves_expectation_and_parent_destination
 test_wrong_home_detected_not_acknowledged
 test_unmarked_captain_input_creates_no_expectation
 test_fm_send_marked_secondmate_creates_pending_and_embeds_corr
+test_fm_send_no_reply_marks_without_expectation
 test_document_pointer_resolves
 test_helper_report_resolves
 test_busy_idle_observation_via_backend_abstraction

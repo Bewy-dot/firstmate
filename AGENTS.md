@@ -99,6 +99,7 @@ state/               volatile runtime signals; gitignored
   <id>.pr-poll       private validated data sidecar for the byte-static PR merge poll
   <id>.pr-poll-registration  private transactional provenance record binding the task, canonical metadata identity, sidecar, and static poll publication
   <id>.pr-poll-retirement  private identity-bound crash-recovery receipt for one exact validated merged result; removed after its poll artifacts retire
+  <id>.pr-merged     the task PR URL recorded on a confirmed merge (fm-pr-merge, merge poll); lets the idle-worker wake see a next=merge report satisfied
   .pr-check-quarantine/  private non-runnable storage for checks neutralized by the non-executing migration
   .pr-check-migration.log  private per-task outcomes distinguishing rebuilt or canonically registered replacement polls, quarantined unarmed polls, and incomplete migrations
   .pr-check-migration-scan-v1  private marker proving the non-executing scan disabled every unsafe legacy check; .pr-check-migration-v1 separately records completed private repairs
@@ -115,7 +116,7 @@ state/               volatile runtime signals; gitignored
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .claude-autoarm.lock .claude-autoarm-epoch .claude-autoarm-failure-notified .claude-autoarm-failure-alarmed .turnend-claude-blocks .turnend-claude-blocks.lock   Claude Stop auto-arm single-flight, epoch, failure-episode, attended-alarm, guard-budget, and budget-lock records; never touch
-  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .notify-once-* .last-* .heartbeat-streak   watcher and notifier internals; never touch
+  .hash-* .count-* .stale-* .stale-since-* .idle-* .idle-woken-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .notify-once-* .last-* .heartbeat-streak   watcher and notifier internals; never touch
   .notify-speech-cache/  generated per-(class,voice,phrase) pre-rendered notification audio, keyed by checksum and TTL-pruned; see bin/fm-notify.sh; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
@@ -282,6 +283,7 @@ A persistent secondmate is recorded in the secondmate registry and runtime state
 Steer a worker with short single-line messages through fail-closed `fm-send`; put long instructions in a file.
 A secondmate's routed reply returns through status or a document pointer, not by firstmate peeking into its chat.
 For the parent-owned correlation, recovery, and escalation contract on marked secondmate requests, see `bin/fm-pending-reply-lib.sh`.
+Send a one-way secondmate message with nothing to answer, such as a relayed decision, with `fm-send.sh --no-reply` so no reply is expected or chased.
 Supervise all live work under section 8.
 
 ### Selected delivery path and approval authority
@@ -375,6 +377,7 @@ Handle actionable wakes as follows:
 
 1. For `signal:`, read the listed event lines first, then reconcile current state only where action depends on it.
 2. For `stale:`, inspect the recorded endpoint and load `stuck-crewmate-recovery` for a stopped, looping, confused, or unresponsive worker; a deep-inspection reason also requires current-state and validation-log inspection.
+   A `needs its next job` reason is a finished worker left idle: give it its next job, answer its pending question, or clean it up.
 3. For `check:`, act on the named poll result, including merges, X-mode events, and process-to-event source results.
 4. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 

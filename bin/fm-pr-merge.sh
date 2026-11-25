@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Merge a task's PR after recording pr= and any available pr_head= through
 # bin/fm-pr-check.sh, so teardown can verify landed work after squash merges.
+# A successful merge also records state/<id>.pr-merged with the PR URL.
 # The full canonical GitHub PR URL is parsed by bin/fm-pr-lib.sh and the derived
 # owner/repository and PR number are passed to gh-axi as separate arguments.
 #
@@ -89,6 +90,9 @@ gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${mer
 # observing the same landing does not beep a second time. Best-effort only: the
 # notifier always exits 0 and never changes this script's merge outcome.
 if [ "$merge_status" -eq 0 ]; then
+  # Durable merged record the watcher's idle-after-report wake reads to tell
+  # that a next=merge report has been satisfied (bin/fm-watch.sh).
+  printf '%s\n' "$URL" > "$STATE/$ID.pr-merged" || true
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
     "$SCRIPT_DIR/fm-notify.sh" --once "pr-merged:$ID" \
     pr-merged "firstmate: PR merged" "$ID: $URL" >/dev/null 2>&1 || true

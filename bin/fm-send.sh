@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Send one line of literal text to a crewmate endpoint, then Enter.
-# Usage: fm-send.sh <target> <text...>
+# Usage: fm-send.sh [--no-reply] <target> <text...>
 #   <target> may be an exact task id, a legacy fm-<id> task label resolved
 #   through this home's state/<id>.meta, or an explicit well-formed backend
 #   target. fm-send refuses unresolved guesses rather than falling back to a
@@ -36,6 +36,12 @@
 # resolves the expectation. Set FM_PENDING_REPLY_EXISTING_CORR=<id> when
 # re-sending a recovery request for an already-open expectation so a second
 # record is not created. Direct unmarked captain input never creates one.
+# --no-reply marks a one-way message that has nothing to answer, such as a
+# relayed captain decision: a secondmate target still receives the
+# from-firstmate marker, followed by a visible `no-reply` token in place of
+# `corr=<id>`, and no pending-reply record, recovery repost, or missed-reply
+# escalation is created. It is refused on a message already carrying a
+# correlation token and is a no-op for crewmate targets, which never get one.
 # A remote secondmate send exits non-zero unless the remote job confirmed the
 # submit: a steer that expired in the remote job queue (exit 75, see
 # bin/fm-remote-job-lib.sh) is reported as not delivered and safe to resend,
@@ -229,6 +235,13 @@ fm_send_resolve_target() {  # <raw-target>
   return 1
 }
 
+NO_REPLY=0
+if [ "${1:-}" = --no-reply ]; then
+  NO_REPLY=1
+  shift
+fi
+[ "$#" -ge 2 ] || { echo "usage: fm-send.sh [--no-reply] <target> <text...> | <target> --key <key>" >&2; exit 2; }
+
 RAW_TARGET=$1
 fm_send_resolve_target "$RAW_TARGET" || exit 1
 T=$RESOLVED_TARGET
@@ -277,7 +290,16 @@ if [ "${1:-}" = "--key" ]; then
   fm_send_record_interrupt "$2" || exit 1
 else
   MESSAGE=$*
-  if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
+  if [ "$MARK_FROM_FIRSTMATE" = 1 ] && [ "$NO_REPLY" = 1 ]; then
+    # One-way message: marked as from firstmate so the secondmate knows its
+    # source, but with no correlation and no parent expectation to miss.
+    if [ -n "$(fm_pending_reply_extract_corr "$MESSAGE")" ]; then
+      echo "error: --no-reply conflicts with the correlation token already in this message" >&2
+      exit 2
+    fi
+    fm_message_mark_from_firstmate "$MESSAGE" MESSAGE
+    MESSAGE="${FM_FROMFIRST_MARK}no-reply ${MESSAGE#"$FM_FROMFIRST_MARK"}"
+  elif [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
     # Reuse an existing correlation id for recovery resends; otherwise create a
     # durable parent expectation before delivery. Transport success never
     # resolves that expectation (see fm-pending-reply-lib.sh).
