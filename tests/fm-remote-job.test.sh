@@ -54,6 +54,31 @@ printf 'started\n' > "$1"
 sleep 3
 printf 'ran\n' > "$2"
 SH
+cat > "$REMOTE_ROOT/bin/fm-log-job.sh" <<'SH'
+#!/bin/bash
+printf '%s\n' "$2" >> "$1"
+SH
+# Stands in for the real control script so scheduling sees genuine steer and
+# poll argv. A send named "blocker" holds the steer slot while its flag exists.
+cat > "$REMOTE_ROOT/bin/fm-remote-secondmate-control.sh" <<'SH'
+#!/bin/bash
+set -u
+case "$1" in
+  send)
+    if [ "$3" = blocker ]; then
+      : > "$FM_HOME/blocker.started"
+      while [ -f "$FM_HOME/blocker.hold" ]; do sleep 0.05; done
+    fi
+    printf 'send %s %s\n' "$2" "$3" >> "$FM_HOME/order.log"
+    ;;
+  state)
+    printf '%s\n' "$2" >> "$FM_HOME/state-runs.log"
+    sleep 0.3
+    printf 'alive %s\n' "$2"
+    ;;
+  *) exit 2 ;;
+esac
+SH
 cat > "$REMOTE_ROOT/bin/fm-output-job.sh" <<'SH'
 #!/bin/bash
 set -e
@@ -292,7 +317,9 @@ JOB_ID=$FM_REMOTE_JOB_ID
 printf '%s\n' "$(fm_remote_job_read_deadline "$FIRST_JOB_DIR")" > "$STATE_ROOT/jobs/$JOB_ID/queue_deadline"
 fm_remote_job_wait "$ACCOUNT_HOME" "$FIRST_JOB_ID" || fail "$FM_REMOTE_JOB_ERROR"
 fm_remote_job_wait "$ACCOUNT_HOME" "$JOB_ID" || fail "$FM_REMOTE_JOB_ERROR"
-[ "$FM_REMOTE_JOB_EXIT" -eq 124 ] || fail "an expired queued job did not publish a timeout result"
+[ "$FM_REMOTE_JOB_EXIT" -eq "$FM_REMOTE_JOB_EXIT_EXPIRED" ] || fail "an expired queued job did not publish the distinct expired result"
+assert_contains "$(cat "$FM_REMOTE_JOB_STDERR")" 'expired in the remote queue before it started' \
+  "an expired queued job did not explain that it never started"
 assert_absent "$QUEUED_SIDE_EFFECT" "the worker executed a queued job after its durable deadline"
 fm_remote_job_reap "$ACCOUNT_HOME" "$FIRST_JOB_ID" || fail "the blocking job could not be reaped"
 fm_remote_job_reap "$ACCOUNT_HOME" "$JOB_ID" || fail "the expired queued job could not be reaped"
@@ -322,6 +349,131 @@ assert_present "$SECOND_DELAYED_SIDE_EFFECT" "the queued job did not receive its
 fm_remote_job_reap "$ACCOUNT_HOME" "$FIRST_JOB_ID" || fail "the first delayed job could not be reaped"
 fm_remote_job_reap "$ACCOUNT_HOME" "$JOB_ID" || fail "the second delayed job could not be reaped"
 pass "queued jobs receive a fresh bounded execution window"
+
+wait_job_running() { # <job-id> <message>
+  local dir="$STATE_ROOT/jobs/$1"
+  for _ in $(seq 1 100); do
+    [ "$(fm_remote_job_read_state "$dir" 2>/dev/null || true)" = running ] && return 0
+    sleep 0.05
+  done
+  fail "$2"
+}
+
+start_blocker_steer() { # holds the steer slot; sets BLOCKER_ID
+  rm -f -- "$REMOTE_HOME/blocker.started"
+  : > "$REMOTE_HOME/blocker.hold"
+  fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+    fm-remote-secondmate-control.sh send ios blocker < /dev/null > /dev/null
+  BLOCKER_ID=$FM_REMOTE_JOB_ID
+  for _ in $(seq 1 100); do
+    [ -f "$REMOTE_HOME/blocker.started" ] && return 0
+    sleep 0.05
+  done
+  fail "the blocking steer did not start"
+}
+
+release_blocker_steer() {
+  rm -f -- "$REMOTE_HOME/blocker.hold"
+  fm_remote_job_wait "$ACCOUNT_HOME" "$BLOCKER_ID" || fail "$FM_REMOTE_JOB_ERROR"
+  fm_remote_job_reap "$ACCOUNT_HOME" "$BLOCKER_ID" || fail "the blocking steer could not be reaped"
+}
+
+LONG_SIDE_EFFECT="$TMP_ROOT/long-poll-side-effect"
+FM_REMOTE_JOB_QUEUE_TIMEOUT=30
+FM_REMOTE_JOB_TIMEOUT=15
+: > "$REMOTE_HOME/order.log"
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-delay-job.sh 8 "$LONG_SIDE_EFFECT" < /dev/null > /dev/null
+LONG_ID=$FM_REMOTE_JOB_ID
+wait_job_running "$LONG_ID" "the long job did not begin running"
+STEER_BEGAN=$(date +%s)
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-remote-secondmate-control.sh send ios beside-long < /dev/null > /dev/null
+STEER_ID=$FM_REMOTE_JOB_ID
+fm_remote_job_wait "$ACCOUNT_HOME" "$STEER_ID" || fail "$FM_REMOTE_JOB_ERROR"
+STEER_ELAPSED=$(( $(date +%s) - STEER_BEGAN ))
+[ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "the steer beside a long job failed"
+[ "$STEER_ELAPSED" -le 4 ] || fail "the steer waited ${STEER_ELAPSED}s behind a running long job"
+assert_grep 'send ios beside-long' "$REMOTE_HOME/order.log" "the steer beside a long job did not run"
+assert_absent "$LONG_SIDE_EFFECT" "the long job finished before the steer, so the steer did not run beside it"
+[ "$(fm_remote_job_read_state "$STATE_ROOT/jobs/$LONG_ID")" = running ] \
+  || fail "the long job was disturbed by the steer running beside it"
+fm_remote_job_reap "$ACCOUNT_HOME" "$STEER_ID" || fail "the steer could not be reaped"
+fm_remote_job_wait "$ACCOUNT_HOME" "$LONG_ID" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "the long job did not complete after a steer ran beside it"
+assert_present "$LONG_SIDE_EFFECT" "the long job lost its side effect after a steer ran beside it"
+fm_remote_job_reap "$ACCOUNT_HOME" "$LONG_ID" || fail "the long job could not be reaped"
+pass "a steer starts within seconds beside a running long job"
+
+: > "$REMOTE_HOME/order.log"
+start_blocker_steer
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-log-job.sh "$REMOTE_HOME/order.log" older-a < /dev/null > /dev/null
+OLDER_A=$FM_REMOTE_JOB_ID
+sleep 1.1
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-log-job.sh "$REMOTE_HOME/order.log" older-b < /dev/null > /dev/null
+OLDER_B=$FM_REMOTE_JOB_ID
+sleep 1.1
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-remote-secondmate-control.sh send ios newest-steer < /dev/null > /dev/null
+NEWEST_STEER=$FM_REMOTE_JOB_ID
+release_blocker_steer
+for id in "$NEWEST_STEER" "$OLDER_A" "$OLDER_B"; do
+  fm_remote_job_wait "$ACCOUNT_HOME" "$id" || fail "$FM_REMOTE_JOB_ERROR"
+  [ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "a queued ordering job failed"
+  fm_remote_job_reap "$ACCOUNT_HOME" "$id" || fail "a queued ordering job could not be reaped"
+done
+ORDER=$(tr '\n' ',' < "$REMOTE_HOME/order.log")
+[ "$ORDER" = 'send ios blocker,send ios newest-steer,older-a,older-b,' ] \
+  || fail "the queue did not run steers first and other jobs oldest first: $ORDER"
+pass "queued steers run before older jobs, and other jobs run oldest first"
+
+: > "$REMOTE_HOME/state-runs.log"
+start_blocker_steer
+POLL_IDS=()
+for _ in 1 2 3 4 5; do
+  fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+    fm-remote-secondmate-control.sh state ios < /dev/null > /dev/null
+  POLL_IDS+=("$FM_REMOTE_JOB_ID")
+done
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-remote-secondmate-control.sh state other < /dev/null > /dev/null
+OTHER_POLL=$FM_REMOTE_JOB_ID
+release_blocker_steer
+for id in "${POLL_IDS[@]}"; do
+  fm_remote_job_wait "$ACCOUNT_HOME" "$id" || fail "$FM_REMOTE_JOB_ERROR"
+  [ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "a coalesced poll did not receive the shared exit status"
+  [ "$(cat "$FM_REMOTE_JOB_STDOUT")" = 'alive ios' ] || fail "a coalesced poll did not receive the shared output"
+  fm_remote_job_reap "$ACCOUNT_HOME" "$id" || fail "a coalesced poll could not be reaped"
+done
+fm_remote_job_wait "$ACCOUNT_HOME" "$OTHER_POLL" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$(cat "$FM_REMOTE_JOB_STDOUT")" = 'alive other' ] || fail "a distinct poll received another target's output"
+fm_remote_job_reap "$ACCOUNT_HOME" "$OTHER_POLL" || fail "the distinct poll could not be reaped"
+[ "$(grep -c '^ios$' "$REMOTE_HOME/state-runs.log")" -eq 1 ] \
+  || fail "five identical queued state polls did not coalesce into one run"
+[ "$(grep -c '^other$' "$REMOTE_HOME/state-runs.log")" -eq 1 ] \
+  || fail "a distinct state poll was not run exactly once"
+LEFTOVER=$(find "$STATE_ROOT/jobs" -mindepth 1 -maxdepth 1 -name 'job-*' | wc -l | tr -d ' ')
+[ "$LEFTOVER" -eq 0 ] || fail "coalesced polls left $LEFTOVER job records in the queue"
+pass "identical queued read-only polls coalesce into one run with shared results"
+
+: > "$REMOTE_HOME/order.log"
+start_blocker_steer
+FM_REMOTE_JOB_QUEUE_TIMEOUT=1
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-remote-secondmate-control.sh send ios late-steer < /dev/null > /dev/null
+LATE_STEER=$FM_REMOTE_JOB_ID
+FM_REMOTE_JOB_QUEUE_TIMEOUT=30
+sleep 2
+release_blocker_steer
+fm_remote_job_wait "$ACCOUNT_HOME" "$LATE_STEER" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$FM_REMOTE_JOB_EXIT" -eq 75 ] || fail "an expired steer did not publish the distinct expired status"
+assert_contains "$(cat "$FM_REMOTE_JOB_STDERR")" 'it was never run' "an expired steer did not say it never ran"
+fm_remote_job_reap "$ACCOUNT_HOME" "$LATE_STEER" || fail "the expired steer could not be reaped"
+sleep 0.5
+if grep -q 'late-steer' "$REMOTE_HOME/order.log"; then fail "an expired steer was typed after its queue deadline"; fi
+pass "a steer that expires in the queue is reported as never run"
 
 STARTED="$TMP_ROOT/shutdown-started"
 SHUTDOWN_SIDE_EFFECT="$TMP_ROOT/shutdown-side-effect"
