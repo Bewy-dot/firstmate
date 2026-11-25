@@ -55,9 +55,24 @@ case "\${1:-}:\${2:-}" in
 esac
 SH
 cp "$ROOT/bin/fm-remote-doctor.sh" "$ROOT/bin/fm-tasks-axi-lib.sh" \
-  "$ROOT/bin/fm-backend.sh" "$REMOTE_ROOT/bin/"
+  "$ROOT/bin/fm-backend.sh" "$ROOT/bin/fm-composer-lib.sh" "$ROOT/bin/fm-transition-lib.sh" "$REMOTE_ROOT/bin/"
 mkdir -p "$REMOTE_ROOT/bin/backends"
 cp "$ROOT/bin/backends/herdr.sh" "$REMOTE_ROOT/bin/backends/herdr.sh"
+# Stands in for the remote control script: state reads are counted so the
+# tests can prove how many remote jobs a caller really ran.
+cat > "$REMOTE_ROOT/bin/fm-remote-secondmate-control.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "$1" = state ] || exit 2
+printf '%s\n' "$2" >> "$FM_HOME/state-reads.log"
+printf 'alive\n'
+SH
+# Holds the single worker slot while its flag file exists.
+cat > "$REMOTE_ROOT/bin/fm-hold.sh" <<'SH'
+#!/usr/bin/env bash
+: > "$1.started"
+while [ -f "$1" ]; do sleep 0.05; done
+SH
 cat > "$REMOTE_ROOT/bin/fm-mutate.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'mutation\n' >> "$1"
@@ -450,5 +465,88 @@ set -e
 [ "$(cat "$SSH_COUNT")" -eq 1 ] || fail "ambiguous completion was retried"
 [ "$(grep -c mutation "$REMOTE_HOME/mutations")" -eq 1 ] || fail "ambiguous mutation did not execute exactly once"
 pass "unreachable and ambiguous transport failures are surfaced without retry"
+
+# A remote waiter whose SSH session is gone must exit promptly and withdraw the
+# job it staged, instead of polling as an orphan until its bounded wait ends.
+HOLD="$REMOTE_HOME/worker.hold"
+: > "$HOLD"
+fm_on ios fm-hold.sh "$HOLD" < /dev/null > /dev/null 2>&1 &
+HOLDER_PID=$!
+for _ in $(seq 1 100); do
+  [ -f "$HOLD.started" ] && break
+  sleep 0.05
+done
+assert_present "$HOLD.started" "the slot-holding remote job did not start"
+HOLD_WAITER=$(pgrep -f "$REMOTE_ROOT/bin/fm-remote-entrypoint.sh 1" | head -1)
+[ -n "$HOLD_WAITER" ] || fail "could not find the slot-holding remote waiter"
+: > "$REMOTE_HOME/state-reads.log"
+fm_on ios fm-remote-secondmate-control.sh state ios < /dev/null > /dev/null 2>&1 &
+ABANDONED_PID=$!
+WAITER_PID=
+QUEUED_JOB=
+for _ in $(seq 1 100); do
+  for job in "$TMP_ROOT/remote-jobs/jobs"/job-*; do
+    [ -f "$job/argv" ] || continue
+    if tr '\0' ' ' < "$job/argv" | grep -q 'state ios'; then QUEUED_JOB=$job; fi
+  done
+  WAITER_PID=$(pgrep -f "$REMOTE_ROOT/bin/fm-remote-entrypoint.sh 1" | grep -vx "$HOLD_WAITER" | tail -1)
+  [ -n "$QUEUED_JOB" ] && [ -n "$WAITER_PID" ] && break
+  sleep 0.05
+done
+[ -n "$QUEUED_JOB" ] || fail "the abandoned state read was never queued"
+[ -n "$WAITER_PID" ] || fail "could not find the remote waiter for the abandoned state read"
+SESSION_PID=$(ps -o ppid= -p "$WAITER_PID" | tr -d ' ')
+[ -n "$SESSION_PID" ] && [ "$SESSION_PID" -gt 1 ] || fail "the remote waiter had no caller process"
+kill -KILL "$SESSION_PID"
+wait "$ABANDONED_PID" 2>/dev/null || true
+for _ in $(seq 1 80); do
+  kill -0 "$WAITER_PID" 2>/dev/null || break
+  sleep 0.05
+done
+if kill -0 "$WAITER_PID" 2>/dev/null; then fail "the remote waiter kept polling after its caller disconnected"; fi
+assert_absent "$QUEUED_JOB" "the abandoned waiter left its unstarted job queued"
+rm -f -- "$HOLD"
+wait "$HOLDER_PID" 2>/dev/null || true
+sleep 0.5
+[ ! -s "$REMOTE_HOME/state-reads.log" ] || fail "the withdrawn state read still ran on the remote host"
+pass "a remote waiter exits within seconds of its caller disconnecting and withdraws its unstarted job"
+
+# Watcher-driven board refreshes must not turn each status append into a new
+# remote state job: the board's cache shares one read per window.
+if command -v jq >/dev/null 2>&1; then
+  mkdir -p "$LOCAL_HOME/state"
+  printf 'window=remote:ios\nkind=secondmate\nharness=codex\nremote_host=remote-mac\n' > "$LOCAL_HOME/state/ios.meta"
+  snapshot_task() { # <cache-seconds>
+    FM_HOME="$LOCAL_HOME" \
+    FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+    FM_SSH_BIN="$FAKEBIN/fake-ssh" \
+    FM_FAKE_SSH_COUNT="$SSH_COUNT" \
+    FM_FAKE_SSH_LOG="$SSH_LOG" \
+    FM_FAKE_REMOTE_ENTRYPOINT="$REMOTE_ROOT/bin/fm-remote-entrypoint.sh" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux \
+    FM_REMOTE_JOB_STATE_ROOT="$TMP_ROOT/remote-jobs" \
+    FM_SNAPSHOT_REMOTE_CACHE_SECONDS="$1" \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --task-json ios
+  }
+  : > "$REMOTE_HOME/state-reads.log"
+  for _ in 1 2 3; do
+    alive=$(snapshot_task 60 | jq -r '.[0].endpoint.agent_alive')
+    [ "$alive" = alive ] || fail "a cached board snapshot lost the remote second mate's state (got $alive)"
+  done
+  [ "$(grep -c '^ios$' "$REMOTE_HOME/state-reads.log")" -eq 1 ] \
+    || fail "three board snapshots inside the cache window issued more than one remote state read"
+  mkdir "$LOCAL_HOME/state/.remote-read-cache/state.ios.lock"
+  touch -t 200001010000 "$LOCAL_HOME/state/.remote-read-cache/state.ios.rc"
+  alive=$(snapshot_task 60 | jq -r '.[0].endpoint.agent_alive')
+  [ "$alive" = alive ] || fail "a snapshot beside an in-flight remote read did not reuse the last result"
+  [ "$(grep -c '^ios$' "$REMOTE_HOME/state-reads.log")" -eq 1 ] \
+    || fail "a snapshot queued a second remote state read while one was in flight"
+  rmdir "$LOCAL_HOME/state/.remote-read-cache/state.ios.lock"
+  snapshot_task 0 > /dev/null
+  snapshot_task 0 > /dev/null
+  [ "$(grep -c '^ios$' "$REMOTE_HOME/state-reads.log")" -eq 3 ] \
+    || fail "uncached snapshots did not read remote state directly"
+  pass "board snapshots share one remote state read per cache window and never stack reads"
+fi
 
 echo "ALL TESTS PASSED"

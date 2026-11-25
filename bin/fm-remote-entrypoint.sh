@@ -17,8 +17,11 @@
 # stdin is captured as bounded job input. The completed worker result is relayed
 # with stdout and stderr kept separate and its exit status preserved. An SSH
 # disconnect remains unknown completion to fm-on.sh, which preserves OpenSSH's
-# exit 255 behavior. The shared library header owns job fields, bounds, PATH,
-# LaunchAgent contract, and worker environment.
+# exit 255 behavior. The remote waiter records its caller chain before staging
+# and exits as soon as that SSH session is gone, withdrawing its job when the
+# worker has not started it, so timed-out callers never leave orphaned waiters.
+# The shared library header owns job fields, bounds, PATH, LaunchAgent contract,
+# worker environment, and the waiter's caller check.
 set -eu
 
 PROTOCOL=1
@@ -134,10 +137,14 @@ fi
 if ! fm_remote_job_ensure_worker "$ROOT" "$ACCOUNT_HOME"; then
   die "${FM_REMOTE_JOB_ERROR:-remote job worker is unavailable; run fm-on.sh <route> fm-remote-doctor.sh --fix}"
 fi
+CALLER_CHAIN=$(fm_remote_job_caller_chain)
 if ! JOB_ID=$(fm_remote_job_stage "$ACCOUNT_HOME" "$ROOT" "$HOME_PATH" "$COMMAND" "${ARGV[@]:1}"); then
   die "${FM_REMOTE_JOB_ERROR:-cannot stage remote job}" 70
 fi
-if ! fm_remote_job_wait "$ACCOUNT_HOME" "$JOB_ID"; then
+if ! fm_remote_job_wait "$ACCOUNT_HOME" "$JOB_ID" "$CALLER_CHAIN"; then
+  if [ "$FM_REMOTE_JOB_CALLER_GONE" = 1 ]; then
+    fm_remote_job_withdraw "$ACCOUNT_HOME" "$JOB_ID" || true
+  fi
   die "${FM_REMOTE_JOB_ERROR:-remote job did not complete}" 70
 fi
 cat "$FM_REMOTE_JOB_STDOUT"

@@ -15,6 +15,15 @@
 # for done, relay stdout and stderr separately, then reap only their completed
 # record. Input, argv, stdout, and stderr are each capped at 1048576 bytes.
 #
+# A waiter given its caller chain (fm_remote_job_caller_chain) stops as soon as
+# any recorded ancestor up to the SSH session process is gone: the SSH client
+# timed out or disconnected, so nobody can receive the result. It then withdraws
+# its job if the worker has not started it (the record is published with exit
+# 125 and a withdrawal note, then reaped) so abandoned polls neither keep a
+# waiter alive nor occupy the worker later. Waiters poll every
+# FM_REMOTE_JOB_POLL_SECONDS for the first two seconds, then every
+# FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS.
+#
 # The worker accepts only a tracked, non-symlink executable named fm-*.sh below
 # its configured FM_ROOT/bin. Every child receives env -i with the composed
 # PATH, HOME, FM_HOME, FM_ROOT_OVERRIDE, and FM_REMOTE_JOB_ACTIVE=1. The PATH
@@ -34,6 +43,8 @@ FM_REMOTE_JOB_QUEUE_TIMEOUT=${FM_REMOTE_JOB_QUEUE_TIMEOUT:-360}
 FM_REMOTE_JOB_TIMEOUT=${FM_REMOTE_JOB_TIMEOUT:-360}
 FM_REMOTE_JOB_WAIT_GRACE=${FM_REMOTE_JOB_WAIT_GRACE:-30}
 FM_REMOTE_JOB_POLL_SECONDS=${FM_REMOTE_JOB_POLL_SECONDS:-0.05}
+FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS=${FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS:-0.5}
+FM_REMOTE_JOB_CALLER_GONE=0
 FM_REMOTE_JOB_REAP_SECONDS=${FM_REMOTE_JOB_REAP_SECONDS:-3600}
 FM_REMOTE_JOB_OPERATOR_PATH=
 FM_REMOTE_JOB_CHILD_PATH=
@@ -486,8 +497,57 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
   printf '%s\n' "$id"
 }
 
-fm_remote_job_wait() { # <account-home> <id>
-  local account_home=$1 id=$2 job state queue_deadline execution_timeout wait_deadline exit_value
+fm_remote_job_caller_chain() { # prints up to three comma-separated ancestor pids, ending at the SSH session
+  local pid=${PPID:-} depth=0 comm chain=
+  while [ "$depth" -lt 3 ]; do
+    case "$pid" in ''|*[!0-9]*) break ;; esac
+    [ "$pid" -gt 1 ] || break
+    chain="${chain:+$chain,}$pid"
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
+    case "$comm" in *sshd*) break ;; esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    depth=$((depth + 1))
+  done
+  printf '%s\n' "$chain"
+}
+
+fm_remote_job_caller_present() { # <comma-separated pids>; true while every recorded ancestor lives
+  local chain=$1 expected alive
+  [ -n "$chain" ] || return 0
+  expected=$(printf '%s\n' "$chain" | tr ',' '\n' | grep -c .)
+  alive=$(ps -o pid= -p "$chain" 2>/dev/null | grep -c .)
+  [ "$alive" -eq "$expected" ]
+}
+
+fm_remote_job_withdraw() { # <account-home> <id>; withdraws and reaps a job the worker has not started
+  local account_home=$1 id=$2 job claim tmp
+  fm_remote_job_prepare_state "$account_home" || return 1
+  job=$(fm_remote_job_job_dir "$id") || return 1
+  if [ "$(fm_remote_job_read_state "$job" 2>/dev/null || true)" = 'done' ]; then
+    fm_remote_job_reap "$account_home" "$id"
+    return 1
+  fi
+  [ "$(fm_remote_job_read_state "$job" 2>/dev/null || true)" = queued ] || return 1
+  claim="$job/.claim"
+  (umask 077; mkdir "$claim") 2>/dev/null || return 1
+  # The worker claims with the same exclusive mkdir and skips a live owner.
+  (set -C; printf '%s\n' "$$" > "$claim/owner") 2>/dev/null || return 1
+  sleep 0.2
+  [ "$(fm_remote_job_read_single_line "$claim/owner" 64 2>/dev/null || true)" = "$$" ] || return 1
+  [ "$(fm_remote_job_read_state "$job" 2>/dev/null || true)" = queued ] || return 1
+  [ -f "$job/stderr" ] && [ ! -L "$job/stderr" ] || return 1
+  printf 'caller disconnected before the remote job started; it was withdrawn and never run\n' > "$job/stderr" || return 1
+  tmp=$(umask 077; mktemp "$job/.exit.XXXXXX") || return 1
+  printf '125\n' > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$job/exit" || { rm -f -- "$tmp"; return 1; }
+  fm_remote_job_write_state "$job" 'done' || return 1
+  fm_remote_job_reap "$account_home" "$id"
+}
+
+fm_remote_job_wait() { # <account-home> <id> [caller-chain]
+  local account_home=$1 id=$2 caller_chain=${3:-} job state queue_deadline execution_timeout wait_deadline exit_value
+  local started=$SECONDS next_caller_check=$((SECONDS + 1)) poll
+  FM_REMOTE_JOB_CALLER_GONE=0
   fm_remote_job_prepare_state "$account_home" || return 1
   job=$(fm_remote_job_job_dir "$id") || {
     FM_REMOTE_JOB_ERROR="remote job record disappeared or became unsafe"
@@ -534,7 +594,18 @@ fm_remote_job_wait() { # <account-home> <id>
       FM_REMOTE_JOB_ERROR="remote job did not complete within its bounded wait"
       return 1
     fi
-    sleep "$FM_REMOTE_JOB_POLL_SECONDS"
+    if [ -n "$caller_chain" ] && [ "$SECONDS" -ge "$next_caller_check" ]; then
+      if ! fm_remote_job_caller_present "$caller_chain"; then
+        # shellcheck disable=SC2034 # Sourceable API consumed by the entrypoint after this function returns.
+        FM_REMOTE_JOB_CALLER_GONE=1
+        FM_REMOTE_JOB_ERROR="remote job caller disconnected before the result was ready"
+        return 1
+      fi
+      next_caller_check=$((SECONDS + 1))
+    fi
+    poll=$FM_REMOTE_JOB_POLL_SECONDS
+    [ $((SECONDS - started)) -lt 2 ] || poll=$FM_REMOTE_JOB_WAIT_SLOW_POLL_SECONDS
+    sleep "$poll"
   done
 }
 
