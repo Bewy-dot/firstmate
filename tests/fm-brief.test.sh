@@ -669,6 +669,31 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }
 
+# A question asked only in a worker's pane is never seen by its supervisor, so
+# every scaffold must route questions through a needs-decision status line, and
+# a secondmate charter must treat a one-way no-reply message as needing no answer.
+test_questions_route_through_status_and_no_reply_is_one_way() {
+  local home kind id brief
+  home="$TMP_ROOT/question-route-home"
+  mkdir -p "$home/data"
+  for kind in ship scout secondmate; do
+    id="brief-question-$kind"
+    case "$kind" in
+      ship) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode direct-PR >/dev/null 2>&1 ;;
+      scout) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1 ;;
+      secondmate) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1 ;;
+    esac
+    brief="$home/data/$id/brief.md"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep 'must be a `needs-decision:` status line; a question asked only in your pane is never seen' "$brief" \
+      "$kind brief did not require questions to be needs-decision status lines"
+  done
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'A marked message carrying `no-reply` instead of `corr=<id>` is one-way' "$home/data/brief-question-secondmate/brief.md" \
+    "secondmate charter did not explain one-way no-reply messages"
+  pass "fm-brief.sh: questions route through needs-decision and no-reply messages need no answer"
+}
+
 test_scout_and_secondmate_load_decision_hold_policy() {
   local home scout charter
   home="$TMP_ROOT/decision-policy-home"
@@ -727,4 +752,5 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
+test_questions_route_through_status_and_no_reply_is_one_way
 test_scout_and_secondmate_scaffold

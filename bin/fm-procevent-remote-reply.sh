@@ -16,8 +16,13 @@
 # ingests it, acknowledges the captured generation, then registers the next
 # cursor-anchored source. A continuity break is escalated and not re-armed.
 #
-# Ingest accepts only bounded, printable status lines with an allowed lifecycle
-# verb and corr=<16hex>. Exact lines are appended at most once to the parent's
+# Ingest accepts bounded, printable status lines with an allowed lifecycle verb.
+# A line carrying corr=<16hex> answers a marked request and resolves its parent
+# pending reply; a valid line without one is a spontaneous second-mate event
+# (for example a declared pause) and is appended as an uncorrelated event that
+# resolves nothing. A malformed line is skipped and reported on stderr, never
+# appended and never allowed to block the rest of the delta or the re-armed
+# channel. Exact lines are appended at most once to the parent's
 # state/<id>.status. A data/*.md pointer is fetched through the path-confined
 # remote file reader and rewritten to its local private copy before append.
 set -u
@@ -235,13 +240,12 @@ line_valid() { # <line>
   bytes=$(printf '%s' "$line" | LC_ALL=C wc -c | tr -d ' ')
   [ "$bytes" -le "$MAX_LINE_BYTES" ] || return 1
   [ -z "$(printf '%s' "$line" | LC_ALL=C tr -d '\11\40-\176')" ] || return 1
-  printf '%s' "$line" | grep -Eq '^(working|needs-decision|blocked|paused|done|failed|resolved)([[:space:]]+\[[^]]+\])?:' || return 1
-  printf '%s' "$line" | grep -Eq 'corr=[A-Fa-f0-9]{16}'
+  printf '%s' "$line" | grep -Eq '^(working|needs-decision|blocked|paused|done|failed|resolved)([[:space:]]+\[[^]]+\])?:'
 }
 
 cmd_ingest() {
   local id=${1:-} result=${2:-} seq=${3:-} class blank payload schema status path from to from_hash to_hash payload_hash payload_bytes reason
-  local actual_bytes actual_hash line doc local_doc rewritten appended=0 cursor_already=0 lock status_file tmp
+  local actual_bytes actual_hash line doc local_doc rewritten appended=0 skipped=0 cursor_already=0 lock status_file tmp accepted
   validate_id "$id"
   [ -f "$result" ] && [ ! -L "$result" ] || die "result file is unavailable or unsafe: $result"
   class=$(classify_result "$result")
@@ -293,8 +297,16 @@ cmd_ingest() {
     return 3
   fi
   [ "$status" = delta ] && [ "$payload_bytes" -gt 0 ] || { fm_lock_release "$lock"; die "delta result has no payload"; }
+  accepted="$tmp/accepted"
+  : > "$accepted"
   while IFS= read -r line || [ -n "$line" ]; do
-    line_valid "$line" || { fm_lock_release "$lock"; die "delta contains an invalid or uncorrelated status line"; }
+    if ! line_valid "$line"; then
+      skipped=$((skipped + 1))
+      printf 'warning: skipped malformed remote reply line from %s (%s bytes)\n' \
+        "$id" "$(printf '%s' "$line" | LC_ALL=C wc -c | tr -d ' ')" >&2
+      continue
+    fi
+    printf '%s\n' "$line" >> "$accepted"
     rewritten=$line
     while IFS= read -r doc; do
       [ -n "$doc" ] || continue
@@ -309,7 +321,7 @@ cmd_ingest() {
   while IFS= read -r corr; do
     [ -n "$corr" ] || continue
     fm_pending_reply_try_resolve "$STATE" "$corr" "$status_file" >/dev/null 2>&1 || true
-  done < <(grep -Eo 'corr=[A-Fa-f0-9]{16}' "$payload" | cut -d= -f2- | tr 'A-F' 'a-f' | awk '!seen[$0]++')
+  done < <(grep -Eo 'corr=[A-Fa-f0-9]{16}' "$accepted" | cut -d= -f2- | tr 'A-F' 'a-f' | awk '!seen[$0]++')
   if [ -n "$seq" ]; then
     write_ingest_receipt "$id" "$seq" "$result" \
       || { fm_lock_release "$lock"; die "cannot commit remote reply ingestion receipt"; }
@@ -320,7 +332,7 @@ cmd_ingest() {
   fm_lock_release "$lock"
   trap - EXIT
   rm -rf -- "$tmp"
-  printf 'ingested: %s appended=%s offset=%s\n' "$id" "$appended" "$to"
+  printf 'ingested: %s appended=%s skipped=%s offset=%s\n' "$id" "$appended" "$skipped" "$to"
 }
 
 cmd_handle_locked() {

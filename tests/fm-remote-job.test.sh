@@ -79,6 +79,13 @@ case "$1" in
   *) exit 2 ;;
 esac
 SH
+# Stands in for the blocking delta reader so scheduling sees genuine long-poll
+# argv: it holds for the requested seconds, then records that it finished.
+cat > "$REMOTE_ROOT/bin/fm-remote-delta-read.sh" <<'SH'
+#!/bin/bash
+sleep "$4"
+printf 'delta-read finished\n' >> "$FM_HOME/order.log"
+SH
 cat > "$REMOTE_ROOT/bin/fm-output-job.sh" <<'SH'
 #!/bin/bash
 set -e
@@ -404,6 +411,55 @@ fm_remote_job_wait "$ACCOUNT_HOME" "$LONG_ID" || fail "$FM_REMOTE_JOB_ERROR"
 assert_present "$LONG_SIDE_EFFECT" "the long job lost its side effect after a steer ran beside it"
 fm_remote_job_reap "$ACCOUNT_HOME" "$LONG_ID" || fail "the long job could not be reaped"
 pass "a steer starts within seconds beside a running long job"
+
+: > "$REMOTE_HOME/order.log"
+: > "$REMOTE_HOME/state-runs.log"
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-remote-delta-read.sh status.log 0 prefix 8 < /dev/null > /dev/null
+DELTA_ID=$FM_REMOTE_JOB_ID
+wait_job_running "$DELTA_ID" "the long delta read did not begin running"
+SHORT_BEGAN=$(date +%s)
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-log-job.sh "$REMOTE_HOME/order.log" inherit-put < /dev/null > /dev/null
+SHORT_NORMAL=$FM_REMOTE_JOB_ID
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-remote-secondmate-control.sh state ios < /dev/null > /dev/null
+SHORT_POLL=$FM_REMOTE_JOB_ID
+for id in "$SHORT_NORMAL" "$SHORT_POLL"; do
+  fm_remote_job_wait "$ACCOUNT_HOME" "$id" || fail "$FM_REMOTE_JOB_ERROR"
+  [ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "a short job beside a long delta read failed"
+  fm_remote_job_reap "$ACCOUNT_HOME" "$id" || fail "a short job beside a long delta read could not be reaped"
+done
+SHORT_ELAPSED=$(( $(date +%s) - SHORT_BEGAN ))
+[ "$SHORT_ELAPSED" -le 5 ] || fail "short jobs waited ${SHORT_ELAPSED}s behind a running long delta read"
+assert_grep 'inherit-put' "$REMOTE_HOME/order.log" "the short job beside a long delta read did not run"
+assert_grep 'ios' "$REMOTE_HOME/state-runs.log" "the state read beside a long delta read did not run"
+if grep -q 'delta-read finished' "$REMOTE_HOME/order.log"; then
+  fail "the delta read finished before the short jobs, so they did not run beside it"
+fi
+fm_remote_job_wait "$ACCOUNT_HOME" "$DELTA_ID" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "the long delta read did not complete after short jobs ran beside it"
+fm_remote_job_reap "$ACCOUNT_HOME" "$DELTA_ID" || fail "the long delta read could not be reaped"
+pass "short jobs start within seconds beside a running long delta read"
+
+: > "$REMOTE_HOME/order.log"
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-delay-job.sh 4 "$TMP_ROOT/normal-outer-side-effect" < /dev/null > /dev/null
+NORMAL_OUTER=$FM_REMOTE_JOB_ID
+wait_job_running "$NORMAL_OUTER" "the ordinary outer job did not begin running"
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" \
+  fm-log-job.sh "$REMOTE_HOME/order.log" after-normal < /dev/null > /dev/null
+AFTER_NORMAL=$FM_REMOTE_JOB_ID
+sleep 2
+if grep -q 'after-normal' "$REMOTE_HOME/order.log"; then
+  fail "an ordinary job ran beside another ordinary job instead of waiting its turn"
+fi
+for id in "$NORMAL_OUTER" "$AFTER_NORMAL"; do
+  fm_remote_job_wait "$ACCOUNT_HOME" "$id" || fail "$FM_REMOTE_JOB_ERROR"
+  fm_remote_job_reap "$ACCOUNT_HOME" "$id" || fail "an ordinary queued job could not be reaped"
+done
+assert_present "$TMP_ROOT/normal-outer-side-effect" "the ordinary outer job did not finish"
+pass "ordinary jobs still run one at a time outside a long poll"
 
 : > "$REMOTE_HOME/order.log"
 start_blocker_steer

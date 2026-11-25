@@ -5,7 +5,9 @@
 # No-verb signals require positive evidence of work to absorb. Stale panes also
 # absorb reconciled done/parked states: waiting for the primary is healthy idle,
 # while a worker stopped without a reconciled finish or gate still surfaces.
-# A declared external-wait pause is
+# A reconciled finish or gate is not absorbed forever, though: once per idle
+# episode the worker's supervisor is woken that it needs its next job (see
+# idle_after_report_check). A declared external-wait pause is
 # the separate idle absorb case and re-surfaces only on its long bounded cadence,
 # although its initial no-verb status signal still surfaces in normal mode.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
@@ -40,6 +42,14 @@
 #                          count, and demand-deep-inspection marker, for human
 #                          inspection only - never an automatic interrupt,
 #                          signal, or restart of the worker or its tool process.
+#   stale: <window> (idle <N>s after its last report, needs its next job: <why>)
+#                          a reconciled done or parked worker has sat idle for
+#                          IDLE_WAKE_SECS since its last pane change, or for
+#                          IDLE_WAKE_MERGED_SECS after the PR its next=merge
+#                          report waited on was recorded merged; once per idle
+#                          episode (the latest terminal report plus whether its
+#                          PR has merged), never again while that is unchanged,
+#                          and also while afk is active
 #   check: <script>: <out> authenticated check output, always actionable
 #   check: process-event result captured: <keys>
 #                          a durably captured process-to-event result is queued
@@ -151,6 +161,17 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # turn-ended and resets the age. Set generously above any legitimate interval
 # between completed turns, including long tool calls, builds, or test runs.
 BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
+# A worker whose state reconciles to done or parked is healthy waiting, but
+# waiting forever is how a finished worker idles unnoticed. IDLE_WAKE_SECS is
+# how long such a worker may sit with an unchanged pane before its supervisor is
+# woken once that it needs its next job (0 disables). IDLE_WAKE_MERGED_SECS is
+# the shorter grace once the PR that its latest next=merge report waited on is
+# recorded merged (state/<id>.pr-merged), long enough for a normal post-merge
+# cleanup to finish first. See idle_after_report_check.
+IDLE_WAKE_SECS=${FM_IDLE_WAKE_SECS:-600}
+IDLE_WAKE_MERGED_SECS=${FM_IDLE_WAKE_MERGED_SECS:-120}
+case "$IDLE_WAKE_SECS" in ''|*[!0-9]*) IDLE_WAKE_SECS=600 ;; esac
+case "$IDLE_WAKE_MERGED_SECS" in ''|*[!0-9]*) IDLE_WAKE_MERGED_SECS=120 ;; esac
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
@@ -427,6 +448,68 @@ surface_nonterminal_stale() {  # <window> <hash>
     rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
   fi
   wake "stale: $win"
+}
+
+# The latest terminal report in <task>'s status log as "<line-number>:<line>",
+# or "none" when the log holds no terminal report yet.
+last_terminal_report() {  # <task>
+  local f="$STATE/$1.status" found
+  found=$(awk '{ v = $0; sub(/:.*/, "", v); sub(/\[key=.*/, "", v); gsub(/[[:space:]]/, "", v)
+    if (v == "done" || v == "ready-for-merge" || v == "needs-decision" || v == "blocked" || v == "failed") last = NR ":" $0 }
+    END { if (last != "") print last }' "$f" 2>/dev/null || true)
+  printf '%s' "${found:-none}"
+}
+
+# 0 when <task>'s latest terminal report asked for next=merge and that PR has
+# since been recorded merged in state/<id>.pr-merged (written by fm-pr-merge.sh
+# and by this watcher's merge poll). A report naming a different PR URL than the
+# recorded merge is not satisfied.
+idle_report_merged() {  # <task> <report-line>
+  local task=$1 line=$2 merged_url end next pr
+  [ -f "$STATE/$task.pr-merged" ] || return 1
+  merged_url=$(head -n 1 "$STATE/$task.pr-merged" 2>/dev/null || true)
+  end=$(status_end_state_json "$line")
+  next=$(printf '%s' "$end" | jq -r '.next // empty' 2>/dev/null || true)
+  [ "$next" = merge ] || return 1
+  pr=$(printf '%s' "$end" | jq -r '.pr // empty' 2>/dev/null || true)
+  case "$pr" in https://*) [ "$pr" = "$merged_url" ] || return 1 ;; esac
+  return 0
+}
+
+# Wake the supervisor once per idle episode for a worker whose state reconciled
+# to done or parked. An episode is the task plus its latest terminal report plus
+# whether that report's next=merge PR has merged; the pane-change clock
+# (.idle-<key>, reset whenever the pane hash changes) times how long the worker
+# has sat untouched. The wake fires after IDLE_WAKE_SECS, or IDLE_WAKE_MERGED_SECS
+# once the awaited PR merged, and .idle-woken-<key> stops a repeat while the
+# episode is unchanged. Returns 1 when nothing was due, so the caller absorbs.
+idle_after_report_check() {  # <window> <task>
+  local win=$1 task=$2 key report merged=0 episode since_file woken_file age limit why reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  since_file="$STATE/.idle-$key"
+  woken_file="$STATE/.idle-woken-$key"
+  report=$(last_terminal_report "$task")
+  if [ "$report" != none ] && idle_report_merged "$task" "${report#*:}"; then merged=1; fi
+  episode="$task|$report|merged=$merged"
+  [ "$(cat "$woken_file" 2>/dev/null || true)" != "$episode" ] || return 1
+  if [ "$(cat "$since_file" 2>/dev/null || true)" != "$episode" ]; then
+    printf '%s' "$episode" > "$since_file"
+    return 1
+  fi
+  age=$(age_of "$since_file")
+  if [ "$merged" -eq 1 ]; then
+    limit=$IDLE_WAKE_MERGED_SECS
+    why="the PR its report waited on has merged"
+  else
+    [ "$IDLE_WAKE_SECS" -gt 0 ] || return 1
+    limit=$IDLE_WAKE_SECS
+    why="nothing in flight since its last report"
+  fi
+  [ "$age" -ge "$limit" ] || return 1
+  reason="stale: $win (idle ${age}s after its last report, needs its next job: $why)"
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$episode" > "$woken_file"
+  wake "$reason"
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -852,6 +935,7 @@ while :; do
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+          printf '%s\n' "$url" > "$STATE/$id.pr-merged" || true
           # The captain's merged tag, keyed per task so a firstmate-driven merge
           # (bin/fm-pr-merge.sh) and this poll observing the same landing beep once.
           FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
@@ -990,7 +1074,8 @@ EOF
           printf '%s' "$h" > "$sf"
           rm -f "$ssf" "$ewf"
           clear_pause_state "$w"
-          triage_log "absorbed stale (healthy waiting): $w"
+          idle_after_report_check "$w" "$task" \
+            || triage_log "absorbed stale (healthy waiting): $w"
         elif [ "$stale_class" = paused ] && ! afk_present; then
           handle_paused_stale "$w" "$task" "$h"
         elif afk_present; then
@@ -1100,6 +1185,9 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
+      # Pane activity restarts the idle-after-report clock; the woken episode
+      # is kept, so activity alone never repeats an idle wake.
+      rm -f "$STATE/.idle-$key"
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
       else

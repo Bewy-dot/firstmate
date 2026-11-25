@@ -156,26 +156,69 @@ assert_contains "$out" 'handled: remote-reply-ios 2' "earlier generation remaine
   || fail "earlier generation replay duplicated its parent status"
 pass "later generations cannot invalidate an unacknowledged ingested result"
 
-# A digest-valid but uncorrelated line is still rejected at the public ingest
-# boundary. Recalculate its payload commitment so the behavioral assertion is
-# specifically about status validation, not incidental digest failure.
-BAD_RESULT="$TMP_ROOT/bad.result"
-cp "$RESULT" "$BAD_RESULT"
-boundary=$(grep -n -m 1 '^$' "$BAD_RESULT" | cut -d: -f1)
-tail -n "+$((boundary + 1))" "$BAD_RESULT" \
-  | sed 's/corr=0123456789abcdef/no-correlation/' > "$TMP_ROOT/bad.payload"
-bad_bytes=$(LC_ALL=C wc -c < "$TMP_ROOT/bad.payload" | tr -d ' ')
-bad_hash=$(sha256_file "$TMP_ROOT/bad.payload")
-head -n "$boundary" "$BAD_RESULT" \
-  | sed "s/^payload_sha256=.*/payload_sha256=$bad_hash/;s/^payload_bytes=.*/payload_bytes=$bad_bytes/" \
-  > "$TMP_ROOT/bad.header"
-cat "$TMP_ROOT/bad.header" "$TMP_ROOT/bad.payload" > "$BAD_RESULT"
-if remote_env "$ADAPTER" ingest ios "$BAD_RESULT" >/dev/null 2>&1; then
-  fail "ingest accepted a status line with no correlation token"
-fi
-[ "$(grep -cF 'done [corr=0123456789abcdef]' "$PARENT/state/ios.status")" -eq 1 ] \
-  || fail "invalid ingest disturbed the accepted parent status line"
-pass "ingest rejects uncorrelated payload even when its transport digest is valid"
+# Second mates legitimately send spontaneous lines that answer no request, such
+# as a declared pause. A valid-verb line without corr= is ingested as an
+# uncorrelated event that resolves no pending reply; only a genuinely malformed
+# line is skipped, and it never blocks the rest of the delta or the cursor.
+# Build digest-valid results from an empty cursor on a separate second mate so the
+# assertions are about status validation, not transport continuity.
+make_delta_result() { # <payload-file> <from-offset> <from-hash> <prefix-file> <out>
+  local payload=$1 from=$2 from_hash=$3 prefix=$4 out=$5 bytes hash to_hash
+  bytes=$(LC_ALL=C wc -c < "$payload" | tr -d ' ')
+  hash=$(sha256_file "$payload")
+  cat "$payload" >> "$prefix"
+  to_hash=$(sha256_file "$prefix")
+  {
+    printf 'schema=fm-remote-delta.v1\nstatus=delta\npath=state/parent-replies.status\n'
+    printf 'from_offset=%s\nto_offset=%s\n' "$from" "$((from + bytes))"
+    printf 'from_prefix_sha256=%s\nto_prefix_sha256=%s\n' "$from_hash" "$to_hash"
+    printf 'payload_sha256=%s\npayload_bytes=%s\nreason=\n\n' "$hash" "$bytes"
+    cat "$payload"
+  } > "$out"
+  DELTA_TO=$((from + bytes))
+  DELTA_TO_HASH=$to_hash
+}
+SPONT_PREFIX="$TMP_ROOT/spont.prefix"
+: > "$SPONT_PREFIX"
+SPONT_EMPTY=$(sha256_file "$SPONT_PREFIX")
+# shellcheck source=bin/fm-pending-reply-lib.sh
+. "$ROOT/bin/fm-pending-reply-lib.sh"
+SPONT_CORR=$(fm_pending_reply_create "$PARENT" "$PARENT/state" android "check the build") \
+  || fail "could not open a pending reply for the spontaneous-line test"
+fm_pending_reply_confirm_delivery "$PARENT/state" "$SPONT_CORR" >/dev/null 2>&1 \
+  || fail "could not confirm delivery of the spontaneous-line test request"
+pending_phase() {
+  fm_pending_reply_get "$(fm_pending_reply_path "$PARENT/state" "$SPONT_CORR")" phase
+}
+PHASE_BEFORE=$(pending_phase)
+printf '%s\n' \
+  'paused [key=restart-hold]: holding builds until the mini restarts' \
+  'no verb here at all' \
+  "$(printf 'working: bad\001byte')" \
+  'working [key=restart-hold]: resumed after restart' > "$TMP_ROOT/spont.payload"
+make_delta_result "$TMP_ROOT/spont.payload" 0 "$SPONT_EMPTY" "$SPONT_PREFIX" "$TMP_ROOT/spont.result"
+out=$(remote_env "$ADAPTER" ingest android "$TMP_ROOT/spont.result" 2>"$TMP_ROOT/spont.err") \
+  || fail "a delta with spontaneous and malformed lines blocked the reply channel: $(cat "$TMP_ROOT/spont.err")"
+assert_contains "$out" "ingested: android appended=2 skipped=2 offset=$DELTA_TO" \
+  "spontaneous lines were not appended and malformed lines not skipped: $out"
+assert_grep 'paused [key=restart-hold]: holding builds until the mini restarts' "$PARENT/state/android.status" \
+  "a spontaneous uncorrelated pause was not ingested"
+assert_grep 'working [key=restart-hold]: resumed after restart' "$PARENT/state/android.status" \
+  "a valid line after a malformed one was not ingested"
+assert_no_grep 'no verb here at all' "$PARENT/state/android.status" "a malformed line was appended"
+assert_contains "$(cat "$TMP_ROOT/spont.err")" 'skipped malformed remote reply line from android' \
+  "a skipped malformed line was not reported"
+[ "$(sed -n 's/^offset=//p' "$PARENT/state/remote-replies/android.cursor")" = "$DELTA_TO" ] \
+  || fail "the cursor did not advance past a delta with skipped lines"
+[ "$(pending_phase)" = "$PHASE_BEFORE" ] \
+  || fail "an uncorrelated line changed an open pending reply ($PHASE_BEFORE -> $(pending_phase))"
+printf 'done [corr=%s]: build is green\n' "$SPONT_CORR" > "$TMP_ROOT/spont-two.payload"
+make_delta_result "$TMP_ROOT/spont-two.payload" "$DELTA_TO" "$DELTA_TO_HASH" "$SPONT_PREFIX" "$TMP_ROOT/spont-two.result"
+remote_env "$ADAPTER" ingest android "$TMP_ROOT/spont-two.result" >/dev/null 2>&1 \
+  || fail "a correlated line after spontaneous lines was not ingested"
+[ "$(pending_phase)" != "$PHASE_BEFORE" ] \
+  || fail "the correlated answer did not resolve its pending reply"
+pass "spontaneous uncorrelated lines are ingested and malformed lines skipped without blocking the channel"
 
 # The adapter re-armed at the committed cursor. Truncation is detected from the
 # next blocking source and escalated once; it is never silently treated as a new

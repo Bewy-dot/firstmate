@@ -525,6 +525,103 @@ test_waiting_stale_is_silent() {
   pass "reconciled done, parked, and paused crews stay silent across pane churn and old wedge timers"
 }
 
+# A worker that reported done and then sat idle used to be absorbed as healthy
+# waiting forever, so a finished builder could idle for an hour with nobody told
+# (25 Nov 2026). The watcher must wake its supervisor ONCE per idle episode: after
+# the bounded idle time, or sooner once the PR its next=merge report waited on is
+# recorded merged, and never again while that episode is unchanged.
+idle_case() {  # <name> <status-line>; sets dir state fakebin out capture_file window key
+  dir=$(make_case "$1"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-builder"
+  printf 'PR is green. Start the next item now or wait?' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/builder.meta"
+  printf '%s\n' "$2" > "$state/builder.status"
+  printf '%s' "$(seen_sig "$state/builder.status")" > "$state/.seen-builder_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text 'PR is green. Start the next item now or wait?')" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+}
+
+idle_watch_bg() {  # <idle-secs> <merged-secs>
+  : > "$out"
+  watch_bg "$state" "$fakebin" "$out" env \
+    FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_CREW_STATE="state: done · source: status-log · reported done" \
+    FM_IDLE_WAKE_SECS="$1" FM_IDLE_WAKE_MERGED_SECS="$2"
+}
+
+test_idle_after_report_wakes_once_per_episode() {
+  local dir state fakebin out capture_file window key pid
+  idle_case idle-timer 'done: PR 201 green | pr=https://github.com/o/r/pull/201 | checks=green | next=review | owner=captain'
+  idle_watch_bg 2 999
+  pid=$!
+  wait_for_exit "$pid" 80 || fail "an idle finished worker never woke its supervisor: $(cat "$out")"
+  grep -F "stale: $window (idle" "$out" >/dev/null || fail "idle wake did not name the window: $(cat "$out")"
+  grep -F "needs its next job: nothing in flight since its last report" "$out" >/dev/null \
+    || fail "idle wake did not say the worker needs its next job: $(cat "$out")"
+  grep -F "needs its next job" "$state/.wake-queue" >/dev/null || fail "idle wake was not durably queued"
+
+  # The same episode (same report, untouched pane) must not wake again.
+  : > "$state/.wake-queue"
+  idle_watch_bg 1 999
+  pid=$!
+  wait_live "$pid" 40 || { reap "$pid"; fail "an unchanged idle episode woke the supervisor again: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an unchanged idle episode was queued again"; }
+
+  # Pane activity alone (the supervisor typed, the worker answered in its pane)
+  # restarts the idle clock but is not a new episode.
+  printf 'ok, waiting for the merge' > "$capture_file"
+  wait_live "$pid" 40 || { reap "$pid"; fail "pane activity alone repeated the idle wake: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "pane activity alone queued another idle wake"; }
+  reap "$pid"
+  pass "an idle finished worker wakes its supervisor once per idle episode"
+}
+
+test_idle_after_merged_report_wakes_after_short_grace() {
+  local dir state fakebin out capture_file window key pid
+  idle_case idle-merged 'done: PR 201 green | pr=https://github.com/o/r/pull/201 | checks=green | next=merge | owner=captain'
+  # The awaited PR has not merged, or a different PR merged: no early wake.
+  printf 'https://github.com/o/r/pull/999\n' > "$state/builder.pr-merged"
+  idle_watch_bg 999 1
+  pid=$!
+  wait_live "$pid" 40 || { reap "$pid"; fail "an unmerged next=merge report woke early: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an unmerged next=merge report was queued"; }
+
+  # The awaited PR merges: wake once after the short grace.
+  printf 'https://github.com/o/r/pull/201\n' > "$state/builder.pr-merged"
+  wait_for_exit "$pid" 60 || fail "a worker whose awaited PR merged never woke its supervisor: $(cat "$out")"
+  grep -F "needs its next job: the PR its report waited on has merged" "$out" >/dev/null \
+    || fail "merged idle wake did not say the awaited PR merged: $(cat "$out")"
+
+  : > "$state/.wake-queue"
+  idle_watch_bg 999 1
+  pid=$!
+  wait_live "$pid" 30 || { reap "$pid"; fail "the merged idle episode woke twice: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the merged idle episode was queued twice"; }
+  reap "$pid"
+  pass "a worker whose awaited PR merged wakes its supervisor once after a short grace"
+}
+
+test_pr_merge_records_merged_pr() {
+  local dir state fakebin url
+  dir=$(make_case pr-merge-record); state="$dir/state"; fakebin="$dir/fakebin"
+  url=https://github.com/o/r/pull/201
+  printf 'window=test:fm-builder\nkind=ship\n' > "$state/builder.meta"
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fakebin/gh-axi"
+  mkdir -p "$dir/config"
+  printf 'enabled=off\n' > "$dir/config/notify"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    "$ROOT/bin/fm-pr-merge.sh" builder "$url" >/dev/null 2>&1 \
+    || fail "fm-pr-merge.sh failed under a stub forge"
+  [ "$(cat "$state/builder.pr-merged" 2>/dev/null)" = "$url" ] \
+    || fail "a successful merge did not record the merged PR for the idle wake"
+  pass "fm-pr-merge.sh records the merged PR so a next=merge report reads as satisfied"
+}
+
 # --- stale pane, STALE terminal status overridden by an active run: absorbed ---
 # Regression for the 2026-07 herdr false-surface incidents: a crew's own status
 # log gets no new entry once firstmate hands it to a no-mistakes validation
@@ -1886,6 +1983,9 @@ test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_successful_wake_handoff_guard
 test_waiting_stale_is_silent
+test_idle_after_report_wakes_once_per_episode
+test_idle_after_merged_report_wakes_after_short_grace
+test_pr_merge_records_merged_pr
 test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated

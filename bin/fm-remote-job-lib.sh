@@ -28,11 +28,15 @@
 # queued jobs oldest first. fm_remote_job_argv_class names each job's class:
 # steer (fm-remote-secondmate-control.sh send|key) is always taken before any
 # other queued job, and one steer may also run beside an in-flight non-steer job
-# so a long poll can never starve it; steers never run beside each other. poll
-# (read-only state, route, observe, capture, home-summary snapshot, and delta
-# reads) is coalesced: when the worker starts a poll it also claims every queued
-# job with identical root, home, argv, and stdin and publishes that one run's
-# result to each of them. A queued job whose queue_deadline passes before it
+# so a long poll can never starve it; steers never run beside each other.
+# longpoll (the blocking fm-remote-delta-read.sh) is the only class that may
+# wait for minutes, so while one runs the worker also starts any other queued
+# job beside it, one at a time and steers first, so a relaunch, inheritance
+# push, or state read never waits out a long poll; a second long poll still
+# waits its turn. poll (read-only state, route, observe, capture, and
+# home-summary snapshot) and longpoll are coalesced: when the worker starts one
+# it also claims every queued job with identical root, home, argv, and stdin
+# and publishes that one run's result to each of them. A queued job whose queue_deadline passes before it
 # starts is never run; it is published with FM_REMOTE_JOB_EXIT_EXPIRED (75) and
 # a stderr line saying it expired before starting, distinct from the execution
 # timeout 124 and the unknown-completion 125.
@@ -515,7 +519,7 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
   printf '%s\n' "$id"
 }
 
-fm_remote_job_argv_class() { # <command> [args...]; prints steer|poll|normal
+fm_remote_job_argv_class() { # <command> [args...]; prints steer|poll|longpoll|normal
   local class=normal
   case "${1:-}" in
     fm-remote-secondmate-control.sh)
@@ -527,7 +531,7 @@ fm_remote_job_argv_class() { # <command> [args...]; prints steer|poll|normal
     fm-fleet-snapshot.sh)
       [ "$#" -eq 2 ] && [ "$2" = --secondmate-home-summary ] && class=poll
       ;;
-    fm-remote-delta-read.sh) class=poll ;;
+    fm-remote-delta-read.sh) class=longpoll ;;
   esac
   printf '%s\n' "$class"
 }

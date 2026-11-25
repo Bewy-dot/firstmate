@@ -191,6 +191,27 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
   pass "enriched stale wedges bypass status absorption without disturbing busy workers"
 }
 
+# The watcher's idle-after-report wake names a worker that finished and now
+# needs its next job. Its terminal status was already escalated once, so plain
+# stale classification would self-handle it; the away-mode daemon must still
+# escalate it so the idle worker is not silently absorbed again.
+test_idle_after_report_wake_escalates() {
+  local dir state task win key reason
+  dir=$(make_supercase idle-after-report)
+  state="$dir/state"
+  task=builder-c
+  win="sess:fm-$task"
+  reason="stale: $win (idle 130s after its last report, needs its next job: the PR its report waited on has merged)"
+  fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
+  printf '%s\n' 'done: PR 201 green | pr=https://github.com/o/r/pull/201 | checks=green | next=merge | owner=captain' > "$state/$task.status"
+  key=$(printf '%s' "$task" | tr ':/.' '___')
+  last_status_line "$state/$task.status" > "$state/.subsuper-seen-status-$key"
+  LOG="$dir/daemon.log" FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 handle_wake "$reason" "$state"
+  grep -F "needs its next job" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "an idle-after-report wake was self-handled instead of escalated"
+  pass "an idle-after-report wake escalates even after its terminal status was seen"
+}
+
 test_stale_terminal_escalates() {
   local dir state out
   dir=$(make_supercase stale-terminal)
@@ -1836,6 +1857,7 @@ test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
 test_stale_diagnostic_wedge_survives_busy_housekeeping
+test_idle_after_report_wake_escalates
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker

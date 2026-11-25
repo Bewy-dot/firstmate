@@ -93,6 +93,7 @@ Name what changed, what was verified, and what remains; never close with only "d
 Use checks=none when no checks are configured or no PR exists; green requires an observed passing result, never a guess.
 While waiting on CI, report checks=running and keep watching until the result is known; if watching cannot continue, report the exact reason and handoff to firstmate explicitly.
 A needs-decision report must ask the exact question, list the options, recommend a default, and use next=captain-decision with owner=captain or owner=firstmate as appropriate.
+Every question for your supervisor, including "start the next item now or wait?", must be a `needs-decision:` status line; a question asked only in your pane is never seen, because your supervisor does not read your pane for questions.
 A blocked report must name exactly what is needed and from whom, with the next action and responsible owner; use next=captain-decision for an intervention.
 Put correlation tokens, decision keys, tier evidence, and report paths before the four fields; do not add extra fields or a trailing suffix.
 For routed secondmate replies, preserve the corr token and report the routed task's end state, not the persistent domain's idle state.
@@ -265,6 +266,7 @@ You must distinguish who it is from, because the answer goes to a different plac
 A request relayed to you by the main firstmate is tagged with a leading \`$FM_FROMFIRST_LABEL\` marker followed by an invisible system separator; this marker is untypable, so a human never produces it.
 When a message carries that marker, do the work, then respond via the STATUS/ESCALATION path below, never only in this chat: the main firstmate does not read your chat, so a chat-only reply is lost.
 Marked requests also carry a privacy-safe \`corr=<id>\` token after the marker; include that exact token in your parent status reply (or in the status pointer to a detailed doc) so the parent can correlate the answer.
+A marked message carrying \`no-reply\` instead of \`corr=<id>\` is one-way, such as a relayed captain decision: act on it and send no reply or acknowledgement; report later only if the work it starts produces a reportable outcome.
 Optional helper: \`bin/fm-secondmate-report.sh\` can append a correlated status line for you, but a plain \`echo\` that includes the same \`corr=<id>\` is equally valid - do not depend on the helper being present.
 For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
