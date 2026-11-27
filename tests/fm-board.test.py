@@ -833,9 +833,11 @@ else:
         path = self.home / 'processes'
         return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
 
-    def await_snapshot(self):
+    def await_snapshot(self, terminal=None):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
+            if terminal is not None and select.select([terminal], [], [], 0)[0]:
+                os.read(terminal, 65536)
             if self.recorded_processes():
                 return self.recorded_processes()
             time.sleep(.02)
@@ -901,7 +903,7 @@ else:
         self.addCleanup(os.close, slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 100, 0, 0))
         process = self.start_fixture_board(scripts, 'view', stdin=slave, stdout=slave, stderr=slave)
-        self.await_snapshot()
+        self.await_snapshot(master)
         process.kill()
         process.wait(timeout=2)
         self.assert_snapshots_gone()
@@ -983,6 +985,84 @@ else:
         self.assertEqual(self.recorded_processes()[0]['cache'], '60')
         self.assertIn('stale', self.board().lower())
         self.assertIn('fake', self.full())
+
+    def start_watcher_fixture(self, scripts, preflight=False):
+        # Copy dependencies, retaining the fixture board/snapshot executables.
+        for source in (ROOT / 'bin').iterdir():
+            target = scripts / source.name
+            if source.is_file() and not target.exists():
+                shutil.copy(source, target)
+            elif source.is_dir() and source.name == 'backends':
+                shutil.copytree(source, target)
+        for path in (self.home / 'state').glob('fake.*'):
+            path.unlink()
+        command = ('exec "' + str(scripts / 'fm-fleet-snapshot.sh') + '" --json\n' if preflight else
+                   'exec python3 "' + str(scripts / 'fm-board.py') + '" render\n')
+        (scripts / 'fm-board.sh').write_text('#!/bin/sh\nprintf "%s\\n" "$$" >> "$FM_HOME/refreshes"\n' + command)
+        for name, text in (('.pr-check-migration-scan-v1', 'fm-pr-check-migration-scan-v1'),
+                           ('.pr-check-migration-v1', 'fm-pr-check-migration-v1')):
+            path = self.home / 'state' / name
+            path.write_text(text + '\n')
+            path.chmod(0o600)
+        process = subprocess.Popen([str(scripts / 'fm-watch.sh')],
+            env=dict(self.env, FM_ROOT_OVERRIDE=str(self.home), FM_STATE_OVERRIDE=str(self.home / 'state'),
+                     FM_POLL='.05', FM_HEARTBEAT='999999', FM_CHECK_INTERVAL='999999', FM_SIGNAL_GRACE='0'),
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def cleanup():
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        self.addCleanup(cleanup)
+        return process
+
+    def test_watcher_background_ticks_skip_active_refresh_and_killed_parent_cleans_group(self):
+        scripts = self.process_fixture()
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='16', FM_BOARD_COLLECTION_TIMEOUT='20')
+        watcher = self.start_watcher_fixture(scripts)
+        self.await_snapshot()
+        beat = self.home / 'state/.last-watcher-beat'
+        stamps = set()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(stamps) < 3:
+            if beat.exists():
+                stamps.add(beat.stat().st_mtime_ns)
+            time.sleep(.05)
+        self.assertGreaterEqual(len(stamps), 3, 'watcher did not advance through its real loop')
+        self.assertEqual(len((self.home / 'refreshes').read_text().splitlines()), 1)
+        self.assertEqual(len(self.recorded_processes()), 1)
+        watcher.kill()  # The watcher cannot run its EXIT trap.
+        watcher.wait(timeout=2)
+        self.assert_snapshots_gone()
+
+    def test_watcher_background_refreshes_time_out_without_a_viewer(self):
+        self.exercise_watcher_timeouts()
+
+    def test_watcher_bounds_shell_preflight_before_python_collection(self):
+        self.exercise_watcher_timeouts(preflight=True)
+
+    def exercise_watcher_timeouts(self, preflight=False):
+        scripts = self.process_fixture()
+        if preflight:
+            self.env['FM_BOARD_COLLECTION_TIMEOUT'] = '1'
+        watcher = self.start_watcher_fixture(scripts, preflight)
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline and len(self.recorded_processes()) < 3:
+            self.assertIsNone(watcher.poll(), 'watcher exited while waiting for presentation')
+            rows = self.recorded_processes()
+            listing = subprocess.check_output(['ps', '-ax', '-o', 'pid=,stat='], text=True)
+            running = {int(parts[0]) for line in listing.splitlines()
+                       if len(parts := line.split()) == 2 and not parts[1].startswith('Z')}
+            self.assertLessEqual(sum(pid in running for row in rows for pid in (row['pid'], row['child'])), 2)
+            time.sleep(.05)
+        self.assertGreaterEqual(len(self.recorded_processes()), 3)
+        watcher.terminate()
+        watcher.wait(timeout=5)
+        self.assert_snapshots_gone()
 
     def test_collection_deadline_bounds_a_large_incremental_batch(self):
         scripts = self.process_fixture('normal')

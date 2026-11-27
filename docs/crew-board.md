@@ -6,6 +6,7 @@ It reads cached forge evidence without waiting for network requests and does not
 
 The watcher refreshes the presentation when it detects a status append or turn-end marker, before wake triage or delivery.
 The viewer also requests refreshes independently, so no chat message is needed.
+The watcher owns one background refresh at a time, including the shell preflight, and cancels it on exit; loop and signal ticks skip an active refresh.
 Warm status updates normally reach the viewer within about ten seconds.
 Healthy open-PR evidence refreshes about once a minute; slow or unavailable providers remain visibly cached or failed.
 Cold, full, and incremental snapshot collection share one home-specific lock; a live refresh that finds collection or publication busy skips that tick.

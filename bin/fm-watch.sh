@@ -66,6 +66,9 @@
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
+# Board ticks share one owned background refresh per watcher; the board guard
+# bounds shell preflight and collection and kills groups when this watcher exits.
+# The board producer owns the cross-watcher, per-home collection lock.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -783,9 +786,30 @@ event_wait_or_sleep() {
   esac
 }
 
-# --- Main entry: the runtime below runs only when this file is executed as a
-# script. When sourced (unit tests loading the functions above), return here
-# before acquiring the singleton lock or entering the blocking loop.
+# Presentation children are owned independently of wake delivery.
+BOARD_REFRESH_PID=''
+board_refresh_stop() {
+  [ -n "$BOARD_REFRESH_PID" ] || return 0
+  if jobs -pr | grep -qx "$BOARD_REFRESH_PID"; then
+    kill -TERM "$BOARD_REFRESH_PID" 2>/dev/null || true
+  fi
+  wait "$BOARD_REFRESH_PID" 2>/dev/null || true
+  BOARD_REFRESH_PID=''
+}
+board_refresh_tick() {
+  [ "${FM_BOARD_DISABLED:-0}" != 1 ] || return 0
+  if [ -n "$BOARD_REFRESH_PID" ]; then
+    # Only our own running job can suppress the tick; never trust a reused PID.
+    if jobs -pr | grep -qx "$BOARD_REFRESH_PID"; then
+      return 0
+    fi
+    wait "$BOARD_REFRESH_PID" 2>/dev/null || true
+  fi
+  FM_HOME="$FM_HOME" python3 "$SCRIPT_DIR/fm_board_process.py" --refresh >/dev/null 2>&1 &
+  BOARD_REFRESH_PID=$!
+}
+
+# --- Main entry: sourcing loads helpers without starting supervision.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
@@ -818,6 +842,7 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   exit 0
 fi
 watcher_cleanup() {
+  board_refresh_stop
   fm_active_check_stop || return 1
   fm_check_output_cleanup
   fm_custom_check_snapshot_cleanup
@@ -851,11 +876,8 @@ if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; the
 fi
 
 while :; do
-  # Presentation is independent of wake delivery. Its non-blocking lock and
-  # content fingerprint collapse retries, and non-Herdr backends no-op.
-  if [ "${FM_BOARD_DISABLED:-0}" != 1 ]; then
-    FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
-  fi
+  # Presentation never queues behind a previous loop's in-flight refresh.
+  board_refresh_tick
   # Self-eviction: if the singleton lock no longer names this process, a second
   # watcher has taken over (e.g. a transient duplicate from a racy arm). Stand
   # down so the rightful singleton continues alone. The EXIT trap's release
@@ -969,9 +991,7 @@ while :; do
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
     # Publish at signal detection, before grace, wake triage, or delivery exits.
-    if [ "${FM_BOARD_DISABLED:-0}" != 1 ]; then
-      FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-board.sh" refresh >/dev/null 2>&1 &
-    fi
+    board_refresh_tick
     sleep "$SIGNAL_GRACE"
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""

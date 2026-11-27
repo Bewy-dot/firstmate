@@ -5,6 +5,7 @@ timeout, signal, or owner death (including SIGKILL). A private pipe detects owne
 exit without relying on PID reuse; shell callers use their stable parent identity.
 Guards poll every 50ms, reap their command, and never retain the owner's pipe in
 command descendants. They are command-scoped subprocesses, not a resident service.
+The shell entry --refresh owns a watcher refresh, including its shell preflight.
 The shell entry --run SECONDS COMMAND... is used only by board snapshot timeouts
 so nested timeout utilities cannot move unguarded children into separate groups.
 """
@@ -109,6 +110,10 @@ def guard(argv, timeout, reader=None, inherited=()):
 
 
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--refresh']:
+        os.setsid()
+        sys.exit(guard([str(Path(__file__).with_name('fm-board.sh')), 'refresh'],
+                       limit('FM_BOARD_COLLECTION_TIMEOUT', 20)))
     if len(sys.argv) >= 6 and sys.argv[1] == '--guard':
         inherited = tuple(int(fd) for fd in sys.argv[4].split(',') if fd)
         sys.exit(guard(sys.argv[5:], float(sys.argv[3]), int(sys.argv[2]), inherited))
