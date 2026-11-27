@@ -11,7 +11,7 @@
 # any backend; --snapshot imports a previously captured fm-fleet-snapshot.v1
 # object for offline previews and fixture tests, and --home-snapshot imports a
 # second mate's own-home snapshot the same way.
-# Contended refreshes queue one follow-up; warm renders reuse canonical records.
+# Live refreshes skip contention; bounded reads reuse canonical cached records.
 # Data model, config, and rendering are owned by fm-board.py and fm_board_tui.py;
 # fleet semantics remain owned by fm-fleet-snapshot.sh and fm-crew-state.sh.
 set -eu

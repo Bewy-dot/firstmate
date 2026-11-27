@@ -193,12 +193,17 @@ strip_quotes() {
 }
 
 # Bounded no-mistakes call in the worktree; stdout only, never fails the script.
+# Board reads use fm_board_process.py so nested groups die with their owner.
 HAVE_TIMEOUT=none
 if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=timeout
 elif command -v gtimeout >/dev/null 2>&1; then HAVE_TIMEOUT=gtimeout
 elif command -v perl >/dev/null 2>&1; then HAVE_TIMEOUT=perl
 fi
 nm_run() {  # <args...>
+  if [ "${FM_BOARD_PROCESS_GUARD:-0}" = 1 ]; then
+    ( cd "$WT" && python3 "$SCRIPT_DIR/fm_board_process.py" --run "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true
+    return
+  fi
   case "$HAVE_TIMEOUT" in
     timeout)  ( cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
     gtimeout) ( cd "$WT" && gtimeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;

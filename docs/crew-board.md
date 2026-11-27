@@ -6,10 +6,15 @@ It reads cached forge evidence without waiting for network requests and does not
 
 The watcher refreshes the presentation when it detects a status append or turn-end marker, before wake triage or delivery.
 The viewer also requests refreshes independently, so no chat message is needed.
+The watcher owns one background refresh at a time, including the shell preflight, and cancels it on exit; loop and signal ticks skip an active refresh.
 Warm status updates normally reach the viewer within about ten seconds.
 Healthy open-PR evidence refreshes about once a minute; slow or unavailable providers remain visibly cached or failed.
-Expensive fleet collection runs separately from publishing the board, while changed workers are re-read through the canonical snapshot producer.
-A refresh that finds publication busy queues one follow-up that reads the latest inputs after the active writer finishes.
+Cold, full, and incremental snapshot collection share one home-specific lock; a live refresh that finds collection or publication busy skips that tick.
+Collection has a hard wall-clock bound, and command groups are killed when they time out or their owner exits, including a killed viewer.
+Failed reads retain cached rows and show a stale notice instead of starting detached collectors.
+Remote state and summary reads use the shared cache and single-flight path; unavailable or expired remote evidence stays visibly stale.
+The exact bounds and shortening overrides belong to the header of `bin/fm-board.py`.
+Offline previews retain one bounded follow-up when publication is busy.
 Run `bin/fm-board.sh refresh` from the firstmate pane to initialize or restore it immediately.
 Pane operations safely do nothing on other backends; `bin/fm-board.sh render` can still generate the Markdown file there.
 The viewer needs only Python 3 and its standard library, with no third-party package to install.

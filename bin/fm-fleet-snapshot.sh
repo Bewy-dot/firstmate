@@ -10,7 +10,10 @@
 # summary in state/.remote-read-cache/ for N seconds and lets only one such read
 # per key run at a time; a concurrent reader reuses the last result, or reports
 # unknown when none exists, instead of queuing another remote job. Watcher-driven
-# board refreshes therefore cannot flood the remote job queue.
+# board refreshes therefore cannot flood the remote job queue. Cached remote
+# summaries older than that window are explicitly stale.
+# FM_BOARD_PROCESS_GUARD=1 uses the board-owned parent-exit/process-group guard
+# for nested timed reads; normal non-board readers retain their existing runner.
 #
 # --task-json ID emits the same canonical tasks array for one recorded worker,
 # without backlog or cross-home collection, for incremental presentation reads.
@@ -848,7 +851,9 @@ case "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" in ''|*[!0-9]*) FM_SNAPSHOT_SECON
 run_timed() {  # <seconds> <command...>
   local seconds=$1
   shift
-  if command -v timeout >/dev/null 2>&1; then
+  if [ "${FM_BOARD_PROCESS_GUARD:-0}" = 1 ]; then
+    python3 "$SCRIPT_DIR/fm_board_process.py" --run "$seconds" "$@"
+  elif command -v timeout >/dev/null 2>&1; then
     timeout "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
     gtimeout "$seconds" "$@"
@@ -1385,12 +1390,17 @@ secondmate_current_json() {  # <parent-tasks-json>
         --argjson registered "$registered" --argjson summary "$summary" --argjson summary_valid "$summary_valid" --argjson decisions "$decisions" \
         --argjson activities "$activities" --argjson activity_scan "$activity_scan" \
         --argjson reconciliation "$reconciliation" --argjson terminal "$terminal" --argjson contradiction "$contradiction" \
-        --arg event_raw "$event_raw" --arg event_note "$event_note" --argjson event_age "$event_age" '
+        --arg event_raw "$event_raw" --arg event_note "$event_note" --argjson event_age "$event_age" \
+        --argjson cache_seconds "$FM_SNAPSHOT_REMOTE_CACHE_SECONDS" --argjson now "$SNAPSHOT_EPOCH" '
         {id:$id,home:$home,host:($host | if . == "" then null else . end),remote:$remote,registered:$registered,
          current:{state:$state,reason:($current_reason | if . == "" then null else . end)},invalidity:$summary.invalidity,
          provenance:{selected:"structured-home",structured_home:$home,summary_valid:$summary_valid,
            trust:(if $summary_valid then "complete" else "partial-structured" end),parent_event_role:"historical-only"},
-         freshness:{status:"fresh",observed_at:$observed,age_seconds:0},
+         freshness:(if $remote and $cache_seconds > 0 then
+           (try ($summary.generated | fromdateiso8601) catch 0) as $generated
+           | {status:(if $now - $generated > $cache_seconds then "stale" else "fresh" end),
+              observed_at:($summary.generated // $observed),age_seconds:([$now - $generated,0] | max)}
+           else {status:"fresh",observed_at:$observed,age_seconds:0} end),
          active_children:$summary.active_children,
          decisions_open:$summary.decisions_open,holds:$summary.holds,queued:$summary.queued,
          landed:$summary.landed,endpoints:$summary.endpoints,counts:$summary.counts,omitted:$summary.omitted,

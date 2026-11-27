@@ -11,6 +11,9 @@ Colour and glyph choices (docs/crew-board.md "Terminal board"):
   a failure with an explicit label. FM_BOARD_ICONS=plain (or config/board-icons containing
   "plain") swaps Nerd Font powerline glyphs for plain Unicode; NO_COLOR removes
   colour and implies plain glyphs.
+Refreshes are bounded, owned child commands; ticks skip an in-flight refresh,
+and exiting the viewer kills its command tree. FM_BOARD_REFRESH_INTERVAL may
+shorten the default two-second tick interval for isolated soak tests.
 Keys: j/k move, Enter go to the worker's pane, o open PR (else brief), b brief,
 r report, Tab/Shift-Tab section, 1-4 jump, f summary/full detail, PgUp/PgDn/Home/End scroll, q quit.
 """
@@ -28,6 +31,7 @@ import textwrap
 import time
 import tty
 from urllib.parse import quote
+import fm_board_process
 
 C = dict(base='#1e1e2e', surface0='#313244', surface1='#45475a', overlay0='#6c7086',
          text='#cdd6f4', sub='#a6adc8', blue='#89b4fa', green='#a6e3a1', yellow='#f9e2af',
@@ -500,8 +504,12 @@ def run(home, script):
     try:
         while True:
             now = time.monotonic()
-            if os.environ.get('FM_BOARD_DISABLED') != '1' and now - refreshed > 2 and (process is None or process.poll() is not None):
-                process = subprocess.Popen([str(script / 'fm-board.sh'), 'refresh'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.environ.get('FM_BOARD_DISABLED') != '1' and now - refreshed > fm_board_process.limit('FM_BOARD_REFRESH_INTERVAL', 2) and (process is None or process.poll() is not None):
+                if process is not None:
+                    process.close()
+                process = fm_board_process.Command([str(script / 'fm-board.sh'), 'refresh'],
+                    timeout=fm_board_process.limit('FM_BOARD_COLLECTION_TIMEOUT', 20),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 refreshed = now
             path = Path(home) / 'state/board-model.json'
             stamp = tuple(p.stat().st_mtime_ns if p.exists() else None for p in
@@ -560,6 +568,8 @@ def run(home, script):
                         message = (str(exc), 'peach')
                     until = time.monotonic() + 4
     finally:
+        if process is not None:
+            process.close()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         out.write('\x1b[?25h\x1b[?1049l')
         out.flush()
