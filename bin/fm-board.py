@@ -17,15 +17,22 @@ the structured projection the terminal viewer (fm_board_tui.py) draws.
 --pr-snapshot imports the existing opt-in fm-bearings.v1 candidate_prs evidence
 by exact URL and recorded head, without making any network calls.
 Normal renders read the asynchronous fm_pr_state cache and schedule a refresh.
-Warm renders reuse state/board-snapshot.json; a separate singleton collects the
-full fleet every 30s or after structural input changes, outside board.lock.
+Warm renders reuse state/board-snapshot.json, collecting the full fleet every
+30s or after structural input changes. Cold, full and incremental collections
+share board-snapshot.lock; live ticks skip contention and never queue work.
+Each render/refresh has a 20s wall-clock bound; full snapshots have a 16s bound
+and incremental reads an 8s bound, sharing the collection deadline.
+FM_BOARD_COLLECTION_TIMEOUT and FM_BOARD_SNAPSHOT_TIMEOUT may shorten these
+bounds. fm_board_process guards kill command groups on timeout or owner exit,
+including SIGKILL, and reap completed children. Failed reads retain cached rows
+and show a stale notice; no detached inventory collectors are started.
 Changed local workers use the canonical --task-json reader (four concurrent
 reads, one-second validation CLI timeout and eight-second total timeout each), persisted in board-task-cache.json.
 Remote second mate state and summary reads are cached for 60s (single-flight)
 so watcher-driven refreshes cannot flood the remote job queue.
 board-refresh.json suppresses identical refreshes for two seconds; fingerprints
 include turn ends, metadata, status, busy markers, local homes and PR cache files.
-A contended publisher elects one detached waiter through board-follow-up.lock.
+Only contended offline previews elect a bounded waiter via board-follow-up.lock.
 Movement history in board-model.json retains five transitions for 300s; the
 restart clock is the observation of a Needs-to-Running CI transition, not a
 claim about the push timestamp. Offline fixtures never read a live home/cache.
@@ -43,13 +50,16 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SCRIPT = Path(__file__).resolve().parent
 # Watcher-driven refreshes fire on every status append, so remote second mate
 # reads are shared for 60s per home (fm-fleet-snapshot.sh header owns the cache).
-os.environ.setdefault('FM_SNAPSHOT_REMOTE_CACHE_SECONDS', '60')
+os.environ['FM_SNAPSHOT_REMOTE_CACHE_SECONDS'] = '60'
+os.environ['FM_BOARD_PROCESS_GUARD'] = '1'
 sys.path.insert(0, str(SCRIPT))
+import fm_board_process
 GROUPS = ['Continuo', 'Cadenza', 'ISP', 'AAA', 'MCA website', 'Firstmate', 'Other']
 CATEGORIES = ['multi-firm programme', 'gaps and competitor features',
               'compensation', 'onboarding/legal', 'other']
@@ -403,7 +413,7 @@ def project(snapshot, rules, homes=None):
             owner_labels, incomplete = summary_children(owner, add, now), summary_incomplete(owner)
             if incomplete:
                 add(dict(id=owner['id'], title='Worker status'), 'CHECK', SECTIONS[0],
-                    'Check worker: summary incomplete or unavailable')
+                    'Check worker: summary stale, incomplete or unavailable')
         # A broad owner state cannot distinguish a question, merge, or designed
         # hold. Use the same child classifier as the board, including precedence.
         priority = ('CI FAILED', 'PR FETCH FAILED', 'BLOCKED', 'CI RESPONSE', 'CI EVIDENCE', 'PR HEAD', 'CI NOT FETCHED', 'CHECK', 'NEEDS ANSWER', 'NEXT:', 'CI GREEN', 'no checks configured', 'REVIEW', 'HOLDING', 'WORKING', 'CI RUNNING', 'CI FETCHING', 'WAITING:', 'PAUSED', 'MERGED', 'CLOSED')
@@ -543,6 +553,11 @@ def render_project(rows, labels, now, snapshot, merged, rules):
         compact.append('Worker records need attention; check the fleet status report.')
         full.append('Worker records need attention; check the fleet status report.')
     model = build_model(rows, components, counts, programme_names, now, snapshot, merged)
+    if snapshot.get('board_stale'):
+        notice = 'Fleet snapshot stale: ' + '; '.join(snapshot['board_stale'])
+        compact.append(notice)
+        full.append(notice)
+        model['notice'] = notice
     return '\n'.join(compact) + '\n\n', '\n'.join(full) + '\n', labels, model
 
 
@@ -912,8 +927,8 @@ def collection_signature(home, homes):
     return file_signature(paths)
 
 
-def collect_snapshots(home):
-    # Expensive inventory runs outside the publication lock. Capture signatures
+def collect_snapshots(home, deadline):
+    # Full inventory runs under the collection lock. Capture signatures
     # BEFORE the reads so a racing status append is re-read incrementally.
     prior = read_json(home / 'state/board-snapshot.json', {})
     structure = collection_signature(home, prior.get('homes', {}))
@@ -921,33 +936,60 @@ def collect_snapshots(home):
     signatures = {scope + '/' + p.stem: task_signature(Path(owned['fm_home']), p.stem)
                   for scope, owned in owners.items()
                   for p in (Path(owned['fm_home']) / 'state').glob('*.meta')}
-    snapshot = json.loads(subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--json'],
-                          text=True, timeout=180, env=dict(os.environ, FM_HOME=str(home))))
+    snapshot = json.loads(snapshot_read(home, '--json', timeout=max(.01, deadline - time.monotonic())))
     args = argparse.Namespace(snapshot=None, home_snapshot=None)
-    homes = home_snapshots(args, snapshot)
+    homes = home_snapshots(args, snapshot, deadline)
     # Do not assert freshness of child tasks whose read preceded these stamps.
     write_atomic(home / 'state/board-snapshot.json', json.dumps(dict(
         snapshot=snapshot, homes=homes, signatures=signatures, structure=structure, time=time.time())))
 
 
+def snapshot_read(home, *argv, timeout=None):
+    bound = fm_board_process.limit('FM_BOARD_SNAPSHOT_TIMEOUT', 16 if argv[0] == '--json' else 8)
+    return fm_board_process.run([str(SCRIPT / 'fm-fleet-snapshot.sh'), *argv],
+        timeout=min(bound, timeout) if timeout else bound, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+        env=dict(os.environ, FM_HOME=str(home), FM_CREW_STATE_NM_TIMEOUT='1')).stdout
+
+
+def empty_snapshot(home):
+    return dict(schema='fm-fleet-snapshot.v1', fm_home=str(home),
+                generated=dt.datetime.now(dt.timezone.utc).isoformat(), tasks=[],
+                backlog=dict(records=[]))
+
+
 def live_snapshots(home):
+    # Cold, full and incremental collection share one nonblocking home lock.
+    # A skipped tick can still reproject cached data (including new PR evidence).
+    with (home / 'state/board-snapshot.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            bundle = read_json(home / 'state/board-snapshot.json', {})
+            snapshot = bundle.get('snapshot') or empty_snapshot(home)
+            snapshot['board_stale'] = ['collection already running']
+            return snapshot, bundle.get('homes', {})
+        return collect_live_snapshots(home)
+
+
+def collect_live_snapshots(home):
     path = home / 'state/board-snapshot.json'
     bundle = read_json(path, {})
-    if not bundle:
-        collect_snapshots(home)
-        bundle = read_json(path, {})
-    elif time.time() - bundle['time'] >= 30 or bundle.get('structure') != collection_signature(home, bundle['homes']):
-        with (home / 'state/board-snapshot.lock').open('a') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                pass
-            else:
-                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'collect', str(lock.fileno())],
-                                 pass_fds=(lock.fileno(),), start_new_session=True,
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    snapshot, homes = bundle['snapshot'], bundle['homes']
+    stale = []
+    # Reserve the final fifth of the command bound for publishing cached data.
+    deadline = time.monotonic() + .8 * fm_board_process.limit('FM_BOARD_COLLECTION_TIMEOUT', 20)
+    if not bundle or time.time() - bundle['time'] >= 30 or bundle.get('structure') != collection_signature(home, bundle['homes']):
+        try:
+            collect_snapshots(home, deadline)
+            bundle = read_json(path, {})
+        except (OSError, ValueError, subprocess.SubprocessError):
+            snapshot = bundle.get('snapshot') or empty_snapshot(home)
+            snapshot['board_stale'] = ['fleet collection timed out or failed']
+            return snapshot, bundle.get('homes', {})
+    snapshot = bundle.get('snapshot') or empty_snapshot(home)
+    homes = bundle.get('homes', {})
     saved = read_json(home / 'state/board-task-cache.json', {})
+    mutex = threading.Lock()
     for scope, snap in [('', snapshot), *homes.items()]:
         owner = Path(snap.get('fm_home') or home)
         present = {p.stem for p in (owner / 'state').glob('*.meta')}
@@ -955,31 +997,44 @@ def live_snapshots(home):
         backlog_sig = file_signature([owner / 'data' / name for name in ('backlog.md', 'decision-asked.json')])
         key = '_backlog/' + scope
         if saved.get(key, {}).get('signature') != backlog_sig:
-            raw = subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--backlog-json'],
-                    text=True, timeout=5, env=dict(os.environ, FM_HOME=str(owner)))
-            saved[key] = dict(signature=backlog_sig, value=json.loads(raw))
-        snap['backlog'] = saved[key]['value']
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError('collection deadline')
+                raw = snapshot_read(owner, '--backlog-json', timeout=min(5, remaining))
+                saved[key] = dict(signature=backlog_sig, value=json.loads(raw))
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                stale.append('backlog read timed out or failed')
+        snap['backlog'] = saved.get(key, {}).get('value', snap.get('backlog', {}))
         records = {row['id']: row for row in snap['backlog'].get('records', [])}
         def current(task):
             sig = task_signature(owner, task)
             key = scope + '/' + task
             cached = saved.get(key, {})
-            if cached.get('signature') == sig and cached.get('time', 0) >= bundle['time']:
+            if cached.get('signature') == sig and cached.get('time', 0) >= bundle.get('time', 0):
                 row = cached['row']
-                return task, dict(row, backlog=records.get(task, {})) if row else None
-            if bundle['signatures'].get(key) == sig and task in tasks:
-                return task, dict(tasks[task], backlog=records.get(task, {}))
-            out = subprocess.check_output([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--task-json', task],
-                    text=True, timeout=8, env=dict(os.environ, FM_HOME=str(owner), FM_CREW_STATE_NM_TIMEOUT='1'))
-            rows = json.loads(out)
-            row = rows[0] if rows else None
-            if row is not None:
-                row['backlog'] = records.get(task, {})
-            saved[key] = dict(signature=sig, row=row, time=time.time())
-            return task, row
+                return dict(row, backlog=records.get(task, {})) if row else None
+            if bundle.get('signatures', {}).get(key) == sig and task in tasks:
+                return dict(tasks[task], backlog=records.get(task, {}))
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError('collection deadline')
+                rows = json.loads(snapshot_read(owner, '--task-json', task, timeout=remaining))
+                row = rows[0] if rows else None
+                if row is not None:
+                    row['backlog'] = records.get(task, {})
+                with mutex:
+                    saved[key] = dict(signature=sig, row=row, time=time.time())
+                return row
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                with mutex:
+                    stale.append((scope + '/' + task).strip('/') + ' read timed out or failed')
+                return cached.get('row') or tasks.get(task)
         with ThreadPoolExecutor(max_workers=4) as pool:
-            snap['tasks'] = [row for _, row in pool.map(current, sorted(present)) if row is not None]
+            snap['tasks'] = [row for row in pool.map(current, sorted(present)) if row is not None]
         snap['generated'] = dt.datetime.now(dt.timezone.utc).isoformat()
+    snapshot['board_stale'] = sorted(set(stale))
     write_atomic(home / 'state/board-task-cache.json', json.dumps(saved))
     return snapshot, homes
 
@@ -1042,7 +1097,8 @@ def refresh(args, home):
             flags = fcntl.LOCK_EX if args.wait_lock_fd is not None else fcntl.LOCK_EX | fcntl.LOCK_NB
             fcntl.flock(lock, flags)
         except BlockingIOError:
-            queue_refresh(home)
+            if args.snapshot:
+                queue_refresh(home)
             return
         if args.wait_lock_fd is not None:
             os.close(args.wait_lock_fd)
@@ -1094,7 +1150,7 @@ def refresh(args, home):
             cache.write_text(json.dumps(dict(signature=signature, time=time.time())))
 
 
-def home_snapshots(args, snapshot):
+def home_snapshots(args, snapshot, deadline=None):
     """Own-home snapshots of local second mates; any unreadable home falls back to its summary."""
     homes = {}
     for spec in args.home_snapshot or []:
@@ -1107,9 +1163,10 @@ def home_snapshots(args, snapshot):
         if record.get('remote') or not home or not Path(home).is_dir():
             continue
         try:
-            out = subprocess.run([str(SCRIPT / 'fm-fleet-snapshot.sh'), '--json'], capture_output=True,
-                                 text=True, timeout=120, env=dict(os.environ, FM_HOME=home))
-            owned = json.loads(out.stdout)
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            owned = json.loads(snapshot_read(home, '--json',
+                timeout=deadline - time.monotonic() if deadline is not None else None))
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
         if owned.get('schema') == 'fm-fleet-snapshot.v1':
@@ -1148,11 +1205,18 @@ def main():
 
 if __name__ == '__main__':
     try:
-        if len(sys.argv) == 3 and sys.argv[1] == 'collect':
-            with os.fdopen(int(sys.argv[2])):
-                collect_snapshots(Path(os.environ['FM_HOME']))
-        else:
+        if '--board-worker' in sys.argv:
+            sys.argv.remove('--board-worker')
             main()
+        elif len(sys.argv) > 1 and sys.argv[1] == 'view':
+            main()
+        else:
+            fm_board_process.run([sys.executable, str(Path(__file__).resolve()),
+                                  '--board-worker', *sys.argv[1:]],
+                timeout=fm_board_process.limit('FM_BOARD_COLLECTION_TIMEOUT', 20),
+                stdin=subprocess.DEVNULL,
+                pass_fds=(int(sys.argv[sys.argv.index('--wait-lock-fd') + 1]),)
+                    if '--wait-lock-fd' in sys.argv else ())
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
         print('fm-board: ' + str(exc), file=sys.stderr)
         sys.exit(1)

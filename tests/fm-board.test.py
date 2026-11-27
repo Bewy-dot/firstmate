@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -785,6 +787,247 @@ class Board(unittest.TestCase):
                        env=self.env, capture_output=True, timeout=12, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def process_fixture(self, mode='hang'):
+        """Run the real board entry point with a deterministic snapshot producer."""
+        self.live_refresh_setup()
+        scripts = self.home / 'scripts'
+        scripts.mkdir()
+        for name in ('fm-board.py', 'fm_board_tui.py', 'fm_pr_state.py', 'fm_board_process.py'):
+            source = ROOT / 'bin' / name
+            if source.exists():
+                shutil.copy(source, scripts / name)
+        snapshot = scripts / 'fm-fleet-snapshot.sh'
+        snapshot.write_text("""#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+home = Path(os.environ['FM_HOME'])
+mode = (home / 'mode').read_text()
+if sys.argv[1] == '--backlog-json':
+    print(json.dumps({'records': []}))
+    sys.exit(0)
+if mode == 'nested' and sys.argv[1] != '--nested':
+    subprocess.run([sys.executable, str(Path(__file__).with_name('fm_board_process.py')),
+        '--run', '30', sys.executable, __file__, '--nested'])
+    sys.exit(0)
+if mode in ('hang', 'nested') or (mode == 'incremental' and sys.argv[1] == '--task-json'):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child = subprocess.Popen([sys.executable, '-c',
+        'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])
+    with (home / 'processes').open('a') as log:
+        log.write(json.dumps(dict(pid=os.getpid(), child=child.pid, argv=sys.argv[1:],
+            cache=os.environ.get('FM_SNAPSHOT_REMOTE_CACHE_SECONDS'))) + '\\n')
+    time.sleep(120)
+else:
+    print((home / 'producer.json').read_text() if sys.argv[1] == '--json' else '[]')
+""")
+        snapshot.chmod(0o700)
+        (scripts / 'fm-board.sh').write_text('#!/bin/sh\nexec python3 "' + str(scripts / 'fm-board.py') + '" render\n')
+        (scripts / 'fm-board.sh').chmod(0o700)
+        (self.home / 'mode').write_text(mode)
+        self.snap.update(fm_home=str(self.home), tasks=[], backlog=dict(records=[]))
+        (self.home / 'producer.json').write_text(json.dumps(self.snap))
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='1', FM_BOARD_COLLECTION_TIMEOUT='8')
+        return scripts
+
+    def recorded_processes(self):
+        path = self.home / 'processes'
+        return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
+
+    def await_snapshot(self):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if self.recorded_processes():
+                return self.recorded_processes()
+            time.sleep(.02)
+        self.fail('snapshot did not start')
+
+    def running_pid(self, pid):
+        result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+        return bool(result.stdout.strip()) and not result.stdout.strip().startswith('Z')
+
+    def start_fixture_board(self, scripts, command='render', **kwargs):
+        process = subprocess.Popen([sys.executable, str(scripts / 'fm-board.py'), command],
+            env=self.env, start_new_session=True, **kwargs)
+
+        def cleanup():
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            for row in self.recorded_processes():
+                for pid in (row['pid'], row['child']):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        self.addCleanup(cleanup)
+        return process
+
+    def assert_snapshots_gone(self):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            alive = [pid for row in self.recorded_processes() for pid in (row['pid'], row['child'])
+                     if self.running_pid(pid)]
+            if not alive:
+                return
+            time.sleep(.02)
+        self.fail('snapshot descendants survived: ' + repr(alive))
+
+    def test_hung_snapshot_group_has_a_wall_clock_bound(self):
+        scripts = self.process_fixture()
+        start = time.monotonic()
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.await_snapshot()
+        process.wait(timeout=5)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assert_snapshots_gone()
+        self.assertIn('stale', self.board().lower())
+        model = json.loads((self.home / 'state/board-model.json').read_text())
+        self.assertIn('stale', model['notice'].lower())
+
+    def test_killed_parent_cleans_snapshot_group(self):
+        scripts = self.process_fixture()
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='8', FM_BOARD_COLLECTION_TIMEOUT='20')
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.await_snapshot()
+        process.kill()  # No Python finally/signal handler can help the owner.
+        process.wait(timeout=2)
+        self.assert_snapshots_gone()
+
+    def test_killed_viewer_cleans_its_inflight_collection(self):
+        scripts = self.process_fixture()
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='8', FM_BOARD_COLLECTION_TIMEOUT='20')
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 100, 0, 0))
+        process = self.start_fixture_board(scripts, 'view', stdin=slave, stdout=slave, stderr=slave)
+        self.await_snapshot()
+        process.kill()
+        process.wait(timeout=2)
+        self.assert_snapshots_gone()
+
+    def test_nested_timeout_groups_are_cleaned_when_parent_is_killed(self):
+        scripts = self.process_fixture('nested')
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='8', FM_BOARD_COLLECTION_TIMEOUT='20')
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.await_snapshot()
+        process.kill()
+        process.wait(timeout=2)
+        self.assert_snapshots_gone()
+
+    def test_concurrent_ticks_skip_collection_and_do_not_queue(self):
+        scripts = self.process_fixture()
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='8', FM_BOARD_COLLECTION_TIMEOUT='20')
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.await_snapshot()
+        ticks = [self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 for _ in range(8)]
+        for tick in ticks:
+            self.assertEqual(tick.wait(timeout=3), 0)
+        self.assertEqual(len(self.recorded_processes()), 1)
+        for pid in (self.recorded_processes()[0]['pid'], self.recorded_processes()[0]['child']):
+            os.kill(pid, signal.SIGKILL)
+        process.wait(timeout=4)
+        time.sleep(.3)
+        self.assertEqual(len(self.recorded_processes()), 1, 'contended ticks queued later collection')
+        self.assert_snapshots_gone()
+
+    def test_viewer_reaps_repeated_refreshes_and_quit_cleans_children(self):
+        scripts = self.process_fixture()
+        self.env.update(FM_BOARD_REFRESH_INTERVAL='.02', FM_BOARD_SNAPSHOT_TIMEOUT='1', FM_BOARD_COLLECTION_TIMEOUT='8')
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 100, 0, 0))
+        process = self.start_fixture_board(scripts, 'view', stdin=slave, stdout=slave, stderr=slave)
+        deadline = time.monotonic() + 40
+        counts = []
+        while time.monotonic() < deadline and len(self.recorded_processes()) < 8:
+            if select.select([master], [], [], .05)[0]:
+                os.read(master, 65536)
+            (self.home / 'state/fake.status').touch()  # Exercise every tick, bypassing the unchanged-input debounce.
+            rows = self.recorded_processes()
+            listing = subprocess.check_output(['ps', '-ax', '-o', 'pid=,stat=,command='], text=True)
+            running = {int(parts[0]) for line in listing.splitlines()
+                       if len(parts := line.split(None, 2)) >= 2 and not parts[1].startswith('Z')}
+            alive = [pid for row in rows for pid in (row['pid'], row['child']) if pid in running]
+            self.assertLessEqual(len(alive), 2, 'viewer stacked snapshot groups')
+            counts.append(sum(str(scripts) in line for line in listing.splitlines()))
+        self.assertIsNone(process.poll(), 'viewer exited during repeated refreshes')
+        self.assertGreaterEqual(len(self.recorded_processes()), 8)
+        self.assertLessEqual(max(counts), 8, 'viewer accumulated command guards or zombies')
+        os.write(master, b'q')
+        self.assertEqual(process.wait(timeout=6), 0)
+        self.assert_snapshots_gone()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            listing = subprocess.check_output(['ps', '-ax', '-o', 'command='], text=True)
+            if str(scripts) not in listing:
+                break
+            time.sleep(.05)
+        self.assertNotIn(str(scripts), listing, 'viewer left a collector or guard behind')
+
+    def test_warm_incremental_timeout_preserves_rows_and_uses_remote_cache(self):
+        scripts = self.process_fixture('normal')
+        self.snap['tasks'] = [fixture()['tasks'][0]]
+        self.snap['tasks'][0]['id'] = 'fake'
+        (self.home / 'producer.json').write_text(json.dumps(self.snap))
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertEqual(process.wait(timeout=6), 0)
+        (self.home / 'mode').write_text('incremental')
+        (self.home / 'state/fake.status').write_text('working: Changed\n')
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.await_snapshot()
+        self.assertEqual(process.wait(timeout=6), 0)
+        self.assert_snapshots_gone()
+        self.assertEqual(self.recorded_processes()[0]['cache'], '60')
+        self.assertIn('stale', self.board().lower())
+        self.assertIn('fake', self.full())
+
+    def test_collection_deadline_bounds_a_large_incremental_batch(self):
+        scripts = self.process_fixture('normal')
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertEqual(process.wait(timeout=6), 0)
+        for number in range(20):
+            (self.home / ('state/worker-' + str(number) + '.meta')).write_text('kind=scout\n')
+        (self.home / 'mode').write_text('incremental')
+        self.env.update(FM_BOARD_SNAPSHOT_TIMEOUT='8', FM_BOARD_COLLECTION_TIMEOUT='4')
+        start = time.monotonic()
+        process = self.start_fixture_board(scripts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.await_snapshot()
+        process.wait(timeout=6)
+        self.assertLess(time.monotonic() - start, 6)
+        self.assert_snapshots_gone()
+        self.assertLessEqual(len(self.recorded_processes()), 4, 'batch kept spawning reads past the collection deadline')
+
+    def test_expired_coalesced_remote_summary_is_visible_as_stale(self):
+        self.live_refresh_setup()
+        (self.home / 'state/fake.meta').unlink()
+        (self.home / 'data/secondmates.md').write_text(
+            '- remote - Remote scope (host: fixture-unreachable; root: /fixture; home: /fixture/remote; '
+            'scope: Example; projects: example; added 2026-11-27)\n')
+        cache = self.home / 'state/.remote-read-cache'
+        cache.mkdir()
+        summary = dict(schema='fm-secondmate-home-summary.v1', home='/fixture/remote',
+            generated='2026-11-26T00:00:00Z', valid=True, state='idle', invalidity=dict(ids=[]),
+            active_children=[], decisions_open=[], holds=[], queued=[], landed=[], endpoints=[],
+            counts={}, omitted=[])
+        (cache / 'summary.remote.out').write_text(json.dumps(summary))
+        stamp = cache / 'summary.remote.rc'
+        stamp.write_text('0')
+        os.utime(stamp, (1, 1))
+        (cache / 'summary.remote.lock').mkdir()  # A slow reader already owns refresh.
+        result = subprocess.run([str(ROOT / 'bin/fm-fleet-snapshot.sh'), '--json'],
+            env=dict(self.env, FM_SNAPSHOT_REMOTE_CACHE_SECONDS='60', FM_BOARD_PROCESS_GUARD='1',
+                     FM_SSH_BIN='/usr/bin/false', FM_SNAPSHOT_NOW='2026-11-27T00:00:00Z'),
+            capture_output=True, text=True, timeout=12, check=True)
+        self.snap = json.loads(result.stdout)
+        owner = self.snap['secondmate_current']['records'][0]
+        self.assertEqual(owner['freshness']['status'], 'stale', repr(owner))
+        self.assertEqual(owner['freshness']['age_seconds'], 86400)
+        self.run_board()
+        self.assertIn('summary stale', self.full())
+
     def test_terminal_status_invalidates_warm_cache_within_ten_seconds(self):
         self.live_refresh_setup()
         self.live_refresh()
@@ -795,6 +1038,7 @@ class Board(unittest.TestCase):
         with (self.home / 'state/board.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.live_refresh()
+        self.live_refresh()
         while time.monotonic() - start < 10:
             if 'fake [NEXT: review]' in self.full():
                 break
